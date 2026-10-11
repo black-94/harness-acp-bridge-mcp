@@ -1,6 +1,6 @@
 {
   "name": "@black942026/harness-acp-bridge-mcp",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "type": "module",
   "description": "Stdio MCP proxy for the harness-acp-bridge HTTP server: exposes its eleven operations as tools without owning harnesses, state, or scheduling.",
   "license": "MIT",
