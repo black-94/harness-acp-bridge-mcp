@@ -139,7 +139,7 @@ The proxy is a thin client: the real HTTP response is what it returns. It only s
   `server/src/redact.ts` (sha256 `fa8e4bfedee21dd2c8014544cb8a9daacf8378c83fba874a8ad1714cf7fa450f`).
   The build emits `dist/redact-core.js` + `dist/redact.js`, so nothing is hand-ported. To re-sync:
   copy the two files over `src/` and rebuild.
-- A cross-package parity harness (`scripts/redaction-parity.mjs` at the repo root) loads the
+- A cross-package parity harness (`scripts/tests/redaction-parity.mjs` at the repo root) loads the
   server, MCP, and Pi modules and asserts byte-exact output for both the non-streaming and
   streaming APIs across a representative battery (report: `/tmp/redaction-parity-final.log`).
 - Unknown/unrecognized text — including counters like `max_tokens` and ordinary CJK/emoji text —
