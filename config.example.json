@@ -1,0 +1,8 @@
+{
+  "baseUrl": "http://127.0.0.1:8787",
+  "timeoutMs": 120000,
+  "autoStart": true,
+  "serverEntry": null,
+  "configPath": null,
+  "startupTimeoutMs": 30000
+}
