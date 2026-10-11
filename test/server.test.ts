@@ -2,7 +2,7 @@ import { createServer, type Server } from "node:http";
 import { AddressInfo } from "node:net";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createBridgeMcpServer } from "../src/server.ts";
 import { TOOL_NAMES } from "../src/contract.ts";
 
@@ -77,6 +77,33 @@ describe("MCP server wiring", () => {
     const result = await mcp.callTool({ name: "live_output", arguments: { session_id: "s", offset: 3 } });
     expect(result.isError).toBe(true);
     expect(http.requests).not.toContain("live_output");
+  });
+
+  it.each(["wait", "send_message"])("uses the correct abort policy for %s", async name => {
+    let terminal = false;
+    const http = await stub(method => {
+      if (method === "ping") return { ok: true, data: { status: "ok", protocol_version: 2 } };
+      if (method === "send_message") return { ok: true, data: { message_id: "m1" } };
+      return { ok: true, data: { session_id: "s1", message_id: "m1", state: terminal ? "completed" : "running", terminal, questions: [], result: terminal ? { text: "done" } : undefined } };
+    });
+    cleanups.push(http.close);
+    const mcp = await connect(http.baseUrl);
+    const controller = new AbortController();
+    const args = name === "wait" ? { session_id: "s1", message_id: "m1" } : { session_id: "s1", text: "hello" };
+    const promise = mcp.callTool({ name, arguments: args }, undefined, { signal: controller.signal });
+    await vi.waitFor(() => expect(http.requests).toContain("message_status"));
+    controller.abort();
+    await expect(promise).rejects.toThrow();
+    if (name === "send_message") {
+      await vi.waitFor(() => expect(http.requests.filter(method => method === "cancel_message")).toHaveLength(1));
+    } else {
+      await new Promise(resolve => setTimeout(resolve, 200));
+      expect(http.requests).not.toContain("cancel_message");
+      terminal = true;
+      const resumed = await mcp.callTool({ name: "wait", arguments: { session_id: "s1", message_id: "m1" } });
+      expect(text(resumed)).toMatchObject({ terminal: true, result: { text: "done" } });
+      expect(http.requests).not.toContain("send_message");
+    }
   });
 
   it("flags a failed terminal message as a tool error while preserving its status", async () => {

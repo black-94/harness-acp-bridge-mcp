@@ -65,7 +65,7 @@ export function createBridgeMcpServer(settings: McpSettings): McpServer {
 
   register(WAIT_TOOL.name, { title: WAIT_TOOL.title, description: WAIT_TOOL.description, inputSchema: WAIT_TOOL.inputSchema, annotations: WAIT_TOOL.annotations }, async (args, extra) => {
     await ensure();
-    return status(await waitForMessage(client, interactions, args as unknown as MessageRef, extra.signal, { pollIntervalMs: POLL_INTERVAL_MS }));
+    return status(await waitForMessage(client, interactions, args as unknown as MessageRef, extra.signal, { pollIntervalMs: POLL_INTERVAL_MS, cancelOnAbort: false }));
   });
 
   return server;

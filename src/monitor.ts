@@ -14,7 +14,7 @@ import type { Decision, InteractionHandler, Question } from "./interactions.js";
 import type { BridgeHttpClient } from "./http.js";
 
 export interface MessageRef { session_id: string; message_id: string }
-export interface WaitOptions { pollIntervalMs: number }
+export interface WaitOptions { pollIntervalMs: number; cancelOnAbort?: boolean }
 
 export function firstQuestion(status: Record<string, unknown>): Question | undefined {
   const questions = Array.isArray(status.questions) ? status.questions : [];
@@ -101,7 +101,8 @@ export async function waitForMessage(
       await delay(options.pollIntervalMs, undefined, { signal });
     }
   } catch (error) {
-    if (signal.aborted) await client.call("cancel_message", { ...ref }).catch(() => {});
+    // send_message keeps its original policy; the wait tool only stops local waiting.
+    if (signal.aborted && options.cancelOnAbort !== false) await client.call("cancel_message", { ...ref }).catch(() => {});
     throw error;
   }
 }

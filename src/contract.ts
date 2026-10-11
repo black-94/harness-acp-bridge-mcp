@@ -222,7 +222,7 @@ export const WAIT_TOOL: McpTool = {
   name: "wait",
   title: "Wait for message",
   description:
-    "Wait for a previously submitted message by session_id/message_id without resubmitting it. Handles reverse requests through MCP elicitation when supported; otherwise returns waiting_input with the original question so the model can answer_question and wait again. Aborting cancels the remote message.",
+    "Wait for a previously submitted message by session_id/message_id without resubmitting it. Handles reverse requests through MCP elicitation when supported; otherwise returns waiting_input with the original question so the model can answer_question and wait again. Aborting only stops local waiting and leaves the remote message running; another wait can resume it.",
   inputSchema: z.object({ session_id: z.string().min(1), message_id: z.string().min(1) }).strict(),
   annotations: external,
 };

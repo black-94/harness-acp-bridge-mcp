@@ -101,8 +101,10 @@ an MCP **elicitation** when the connected client advertised the capability: offe
 options are mapped back to their exact `optionId`, and nothing is approved by default (a
 decline maps to reject, a cancel to cancel, and an unoffered selection is refused). When the
 client cannot elicit, the tool returns `waiting_input` with the original `questions` so the
-model can call `answer_question` and then `wait`. Aborting the request cancels the remote
-message, matching the Pi client.
+model can call `answer_question` and then `wait`. Aborting `wait` only stops local waiting
+and leaves the remote message running; a later `wait` can resume it. Aborting `send_message`
+still cancels the remote message, matching the Pi client. Server timeout, question-answer,
+and JSONL error policies are unchanged.
 
 `live_output` is the only way to read incremental output; no preview is ever mixed into a
 result. `send_message`/`wait` return only the terminal status (whose `result` is the server's

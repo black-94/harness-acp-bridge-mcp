@@ -24,6 +24,26 @@ const pending = (captured: { signal?: AbortSignal }): InteractionHandler => ({
 });
 
 describe("MCP waitForMessage", () => {
+  it.each([false, true])("handles an already-aborted signal with cancelOnAbort=%s", async cancelOnAbort => {
+    const { client, call } = fakeClient(() => terminal());
+    const controller = new AbortController();
+    controller.abort();
+    await expect(waitForMessage(client, { resolve: async () => undefined }, ref, controller.signal, { pollIntervalMs: 5, cancelOnAbort })).rejects.toThrow();
+    expect(call.mock.calls.map(([name]) => name)).toEqual(cancelOnAbort ? ["cancel_message"] : []);
+  });
+  it("stops wait-only elicitation without cancelling or answering on abort, then resumes", async () => {
+    const { client, call } = fakeClient(() => waiting(question("A")));
+    const captured: { signal?: AbortSignal } = {};
+    const controller = new AbortController();
+    const promise = waitForMessage(client, pending(captured), ref, controller.signal, { pollIntervalMs: 5, cancelOnAbort: false });
+    await vi.waitFor(() => expect(captured.signal).toBeDefined());
+    controller.abort();
+    await expect(promise).rejects.toThrow();
+    expect(captured.signal?.aborted).toBe(true);
+    expect(call.mock.calls.some(([name]) => name === "cancel_message" || name === "answer_question")).toBe(false);
+    const status = await waitForMessage(client, { resolve: async () => undefined }, ref, new AbortController().signal, { pollIntervalMs: 5, cancelOnAbort: false });
+    expect(status.state).toBe("waiting_input");
+  });
   it("returns a terminal status promptly and aborts the pending elicitation", async () => {
     const { client, call } = fakeClient(n => (n === 1 ? waiting(question("A")) : terminal()));
     const captured: { signal?: AbortSignal } = {};
