@@ -1,5 +1,4 @@
 import { createServer, type Server } from "node:http";
-import { createRequire } from "node:module";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,15 +7,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ServerLifecycle, redact } from "../src/lifecycle.ts";
 import type { McpSettings } from "../src/config.ts";
 import { ServerLifecycle as PiServerLifecycle } from "../../pi-extension/src/lifecycle.ts";
-import { bridgeConfig, freePort, killRegistryServers, registry, serverAvailable } from "./support.ts";
-
-const require = createRequire(import.meta.url);
+import { bridgeConfig, freePort, killRegistryServers, newContractServerEntry, registry, serverAvailable } from "./support.ts";
 
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup(); });
 
 function settings(baseUrl: string, clientDir: string, overrides: Partial<McpSettings> = {}): McpSettings {
-  return { baseUrl, timeoutMs: 15000, autoStart: true, serverEntry: null, configPath: null, startupTimeoutMs: 15000, ...overrides };
+  return { baseUrl, timeoutMs: 15000, autoStart: true, serverEntry: newContractServerEntry(), configPath: null, startupTimeoutMs: 15000, ...overrides };
 }
 
 async function stubListener(port: number, protocolVersion: unknown): Promise<Server> {
@@ -34,6 +31,37 @@ describe("diagnostics redaction", () => {
     expect(output).not.toContain("SECRETVALUE");
     expect(output).not.toContain("abcdef123456");
     expect(output).not.toContain("\x1b");
+  });
+});
+
+describe("protocol compatibility (no server spawn)", () => {
+  it("treats a reachable but incompatible listener as present and starts nothing", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mcp-life-"));
+    const port = await freePort();
+    const listener = await stubListener(port, 1);
+    cleanups.push(() => new Promise<void>(resolve => listener.close(() => resolve())));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const clientDir = join(dir, "client");
+    const lifecycle = new ServerLifecycle(settings(`http://127.0.0.1:${port}`, clientDir), { ...process.env, HARNESS_ACP_BRIDGE_CLIENT_DIR: clientDir });
+    expect(await lifecycle.probe()).toBe("incompatible");
+    await expect(lifecycle.ensure()).rejects.toMatchObject({ code: "incompatible_server" });
+    expect(registry(clientDir)).toEqual({});
+  });
+
+  it("rejects an older-protocol daemon without restarting or killing it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mcp-life-"));
+    const port = await freePort();
+    const listener = await stubListener(port, 2);
+    cleanups.push(() => new Promise<void>(resolve => listener.close(() => resolve())));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const clientDir = join(dir, "client");
+    const lifecycle = new ServerLifecycle(settings(`http://127.0.0.1:${port}`, clientDir), { ...process.env, HARNESS_ACP_BRIDGE_CLIENT_DIR: clientDir });
+    expect(await lifecycle.probe()).toBe("incompatible");
+    await expect(lifecycle.ensure()).rejects.toMatchObject({ code: "incompatible_server" });
+    expect(registry(clientDir)).toEqual({});
+    // The old daemon is still serving; it was neither replaced nor killed.
+    const response = await fetch(`http://127.0.0.1:${port}/api/ping`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    expect((await response.json() as { ok: boolean }).ok).toBe(true);
   });
 });
 
@@ -72,19 +100,6 @@ describe.runIf(serverAvailable())("managed local server lifecycle", () => {
     expect(registry(clientDir)).toEqual({});
   });
 
-  it("treats a reachable but incompatible listener as present and starts nothing", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "mcp-life-"));
-    const port = await freePort();
-    const listener = await stubListener(port, 1);
-    cleanups.push(() => new Promise<void>(resolve => listener.close(() => resolve())));
-    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
-    const clientDir = join(dir, "client");
-    const lifecycle = new ServerLifecycle(settings(`http://127.0.0.1:${port}`, clientDir), { ...process.env, HARNESS_ACP_BRIDGE_CLIENT_DIR: clientDir });
-    expect(await lifecycle.probe()).toBe("incompatible");
-    await expect(lifecycle.ensure()).rejects.toMatchObject({ code: "incompatible_server" });
-    expect(registry(clientDir)).toEqual({});
-  });
-
   it("converges two concurrent starts on a single instance", async () => {
     const dir = mkdtempSync(join(tmpdir(), "mcp-life-"));
     const port = await freePort();
@@ -110,7 +125,7 @@ describe.runIf(serverAvailable())("managed local server lifecycle", () => {
     writeFileSync(config, bridgeConfig(port, join(dir, "sessions")));
     const clientDir = join(dir, "client");
     cleanups.push(() => { killRegistryServers(clientDir); rmSync(dir, { recursive: true, force: true }); });
-    const entry = pathToFileURL(require.resolve("@black942026/harness-acp-bridge-server")).href;
+    const entry = pathToFileURL(newContractServerEntry()!).href;
     const baseUrl = `http://127.0.0.1:${port}`;
     const env = { ...process.env, HARNESS_ACP_BRIDGE_CLIENT_DIR: clientDir };
     const result = await new ServerLifecycle(settings(baseUrl, clientDir, { configPath: config, serverEntry: entry }), env).ensure();
@@ -152,7 +167,7 @@ describe.runIf(serverAvailable())("managed local server lifecycle", () => {
     const clientDir = join(dir, "client");
     cleanups.push(() => { killRegistryServers(clientDir); rmSync(dir, { recursive: true, force: true }); });
     const env = { ...process.env, HARNESS_ACP_BRIDGE_CLIENT_DIR: clientDir };
-    const piSettings = { baseUrl, requestTimeoutMs: 15000, interactionTimeoutMs: 5000, pollIntervalMs: 200, autoStart: true, serverEntry: null, configPath: config, startupTimeoutMs: 15000 };
+    const piSettings = { baseUrl, requestTimeoutMs: 15000, interactionTimeoutMs: 5000, pollIntervalMs: 200, autoStart: true, serverEntry: newContractServerEntry(), configPath: config, startupTimeoutMs: 15000 };
     const results = await Promise.all([
       new ServerLifecycle(settings(baseUrl, clientDir, { configPath: config }), env).ensure(),
       new PiServerLifecycle(piSettings, env).ensure(),

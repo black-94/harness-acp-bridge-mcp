@@ -10,7 +10,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { bridgeConfig, freePort, killRegistryServers, mcpMain, registry, serverAvailable } from "./support.ts";
+import { bridgeConfig, freePort, killRegistryServers, mcpMain, newContractServerEntry, registry, serverAvailable } from "./support.ts";
 
 interface CallResult { content?: Array<{ type?: string; text?: string }>; isError?: boolean }
 function payload(result: CallResult): any {
@@ -34,6 +34,8 @@ describe.runIf(serverAvailable())("MCP proxy with autostart, elicitation and syn
   const proxyEnv = (): Record<string, string> => ({
     ...getDefaultEnvironment(),
     HARNESS_ACP_BRIDGE_URL: baseUrl,
+    // Start the in-repo server build (not the installed dependency).
+    HARNESS_ACP_BRIDGE_SERVER_ENTRY: newContractServerEntry()!,
     HARNESS_ACP_BRIDGE_CONFIG: join(dir, "config.yaml"),
     HARNESS_ACP_BRIDGE_CLIENT_DIR: clientDir,
     HARNESS_ACP_BRIDGE_TIMEOUT_MS: "15000",
@@ -79,20 +81,21 @@ describe.runIf(serverAvailable())("MCP proxy with autostart, elicitation and syn
   afterAll(async () => {
     await capable?.close().catch(() => {});
     killRegistryServers(clientDir);
-    if (dir) rmSync(dir, { recursive: true, force: true });
+    // The detached server keeps writing its log briefly after SIGTERM; retry the recursive remove.
+    if (dir) rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
-  it("lists the twelve operations plus wait", async () => {
+  it("lists the eleven operations plus wait", async () => {
     const listed = await capable.listTools();
     expect(listed.tools.map(tool => tool.name).sort()).toEqual([
       "answer_question", "auth_status", "authenticate", "cancel_message", "close_session", "create_session",
-      "live_output", "message_status", "ping", "search_harness", "send_message", "set_session_options", "wait",
+      "message_status", "ping", "search_harness", "send_message", "set_session_options", "wait",
     ]);
   });
 
   it("autostarts the local server when none is running, then pings it", async () => {
     expect(registry(clientDir)).toEqual({});
-    expect(await call(capable, "ping")).toMatchObject({ status: "ok", protocol_version: 2 });
+    expect(await call(capable, "ping")).toMatchObject({ status: "ok", protocol_version: 3 });
     expect(Object.keys(registry(clientDir))).toEqual([baseUrl]);
     expect(await call(capable, "search_harness")).toHaveProperty("harnesses.codebuddy");
   });
@@ -161,18 +164,44 @@ describe.runIf(serverAvailable())("MCP proxy with autostart, elicitation and syn
     } finally { await client.close().catch(() => {}); }
   });
 
-  it("pages live output with cursors", async () => {
-    const submitted = await call(capable, "send_message", { session_id: session, text: "fragments😀" });
-    // send_message already waited to terminal; read its output explicitly.
-    let cursor: string | undefined;
-    let text = "";
-    for (let page = 0; page < 100; page++) {
-      const output = await call(capable, "live_output", { session_id: session, message_id: submitted.message_id, limit: 2, ...(cursor ? { cursor } : {}) });
-      for (const event of output.events) if (event.type === "answer") text += event.text;
-      cursor = output.next_cursor;
-      if (!output.has_more) break;
-    }
-    expect(text).toBe("echo:fragments😀");
+  it("returns the terminal result from a normal message (no live_output endpoint)", async () => {
+    const status = await call(capable, "send_message", { session_id: session, text: "fragments😀" });
+    expect(status.terminal).toBe(true);
+    expect(status.result.text).toBe("echo:fragments😀");
+  });
+
+  it("drives a real unauthenticated session through the auth flow to ready", async () => {
+    const messages: string[] = [];
+    const { client } = await spawnProxy({ elicitation: {} }, (request: unknown) => {
+      const params = ((request as { params?: unknown }).params ?? request) as { message?: string; requestedSchema?: { properties?: Record<string, any> } };
+      const properties = (params.requestedSchema?.properties ?? {}) as Record<string, any>;
+      messages.push(String(params.message ?? ""));
+      if (properties.method_id) return { action: "accept", content: { method_id: "device" } };
+      if (properties.opened) return { action: "accept", content: { opened: true } };
+      const content: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(properties)) content[key] = value.type === "boolean" ? true : "blue";
+      return { action: "accept", content };
+    });
+    try {
+      // A login-gated harness: create_session surfaces the structured authentication_required error.
+      const created = await client.callTool({ name: "create_session", arguments: { cwd: dir, model_id: "fake-model", harness: "codex" } }) as CallResult;
+      expect(created.isError).toBe(true);
+      const failure = payload(created);
+      expect(failure.error.code).toBe("authentication_required");
+      const sessionId = failure.error.detail.session_id as string;
+      expect(typeof sessionId).toBe("string");
+
+      const ready = await call(client, "authenticate", { session_id: sessionId });
+      expect(ready).toMatchObject({ state: "ready", terminal: true, authenticated: true });
+      // The unsupported candidate, the full verification URL, and the device code were all shown.
+      expect(messages.some(message => message.includes("Not supported in harness_acp_bridge"))).toBe(true);
+      expect(messages.some(message => message.includes("https://example.test/device"))).toBe(true);
+      expect(messages.some(message => message.includes("ABCD-1234"))).toBe(true);
+
+      const status = await call(client, "auth_status", { session_id: sessionId });
+      expect(status.authenticated).toBe(true);
+      await call(client, "close_session", { session_id: sessionId });
+    } finally { await client.close().catch(() => {}); }
   });
 
   it("closes the session", async () => {

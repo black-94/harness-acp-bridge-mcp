@@ -3,31 +3,37 @@ import { METHODS, TOOL_NAMES, TOOLS, WAIT_TOOL, schemaFor } from "../src/contrac
 
 const EXPECTED = [
   "ping", "search_harness", "create_session", "close_session", "authenticate", "auth_status",
-  "set_session_options", "send_message", "cancel_message", "message_status", "live_output", "answer_question",
+  "set_session_options", "send_message", "cancel_message", "message_status", "answer_question",
 ];
 
 describe("MCP bridge contract", () => {
-  it("exposes the twelve operations plus a wait helper", () => {
+  it("exposes the eleven operations plus a wait helper", () => {
     expect([...METHODS].sort()).toEqual([...EXPECTED].sort());
-    expect(TOOLS).toHaveLength(12);
-    expect(TOOL_NAMES).toHaveLength(13);
+    expect(TOOLS).toHaveLength(11);
+    expect(TOOL_NAMES).toHaveLength(12);
     expect(TOOL_NAMES).toContain("wait");
+    expect(TOOL_NAMES).not.toContain("live_output");
     expect(WAIT_TOOL.name).toBe("wait");
   });
 
   it("removed legacy names are absent", () => {
-    for (const legacy of ["harness_info", "auth_info", "set_model", "message_result", "send"]) {
+    for (const legacy of ["harness_info", "auth_info", "set_model", "message_result", "send", "live_output"]) {
       expect(METHODS).not.toContain(legacy as never);
       expect(TOOL_NAMES).not.toContain(legacy);
     }
   });
 
-  it("live_output uses cursor/limit/wait_ms and rejects the old offset protocol", () => {
-    const schema = schemaFor("live_output");
-    expect(schema.safeParse({ session_id: "s", cursor: "c", limit: 5, wait_ms: 100 }).success).toBe(true);
-    for (const removed of [{ offset: 3 }, { max_bytes: 1024 }, { next_offset: 1 }]) {
-      expect(schema.safeParse({ session_id: "s", ...removed }).success).toBe(false);
-    }
+  it("authenticate takes only session_id and rejects the old method_id parameter", () => {
+    const schema = schemaFor("authenticate");
+    expect(schema.safeParse({ session_id: "s" }).success).toBe(true);
+    expect(schema.safeParse({ session_id: "s", method_id: "agent" }).success).toBe(false);
+    expect(schema.safeParse({}).success).toBe(false);
+  });
+
+  it("create_session no longer accepts an authenticate parameter", () => {
+    const schema = schemaFor("create_session");
+    expect(schema.safeParse({ cwd: "/repo", model_id: "m" }).success).toBe(true);
+    expect(schema.safeParse({ cwd: "/repo", model_id: "m", authenticate: "agent" }).success).toBe(false);
   });
 
   it("send_message keeps the server semantics and drops mode/queue/steering", () => {
@@ -54,11 +60,15 @@ describe("MCP bridge contract", () => {
     expect(schema.safeParse({ cwd: "/repo", model_id: "m", permission_mode: "root" }).success).toBe(false);
   });
 
-  it("answer_question takes a string request_id, answer enum, option_id, and object content", () => {
+  it("answer_question takes a string request_id, answer enum, option_id, and object content; message_id is optional", () => {
     const schema = schemaFor("answer_question");
+    // Message-scoped question.
     expect(schema.safeParse({ session_id: "s", message_id: "m", request_id: "42" }).success).toBe(true);
     expect(schema.safeParse({ session_id: "s", message_id: "m", request_id: "42", answer: "accept", option_id: "allow_once" }).success).toBe(true);
     expect(schema.safeParse({ session_id: "s", message_id: "m", request_id: "42", answer: "accept", content: { value: "x" } }).success).toBe(true);
+    // Session-scoped authentication question: message_id omitted.
+    expect(schema.safeParse({ session_id: "s", request_id: "42", content: { method_id: "agent" } }).success).toBe(true);
+    expect(schema.safeParse({ session_id: "s", request_id: "42" }).success).toBe(true);
     expect(schema.safeParse({ session_id: "s", message_id: "m", request_id: 42 }).success).toBe(false);
     expect(schema.safeParse({ session_id: "s", message_id: "m", request_id: "42", answer: "approve" }).success).toBe(false);
   });

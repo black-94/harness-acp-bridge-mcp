@@ -47,13 +47,14 @@ async function connect(baseUrl: string) {
 }
 
 describe("MCP server wiring", () => {
-  it("lists the twelve bridge tools plus wait and proxies a success envelope", async () => {
-    const http = await stub(() => ({ ok: true, data: { status: "ok", protocol_version: 2 } }));
+  it("lists the eleven bridge tools plus wait and proxies a success envelope", async () => {
+    const http = await stub(() => ({ ok: true, data: { status: "ok", protocol_version: 3 } }));
     cleanups.push(http.close);
     const mcp = await connect(http.baseUrl);
     const listed = await mcp.listTools();
     expect(listed.tools.map(tool => tool.name).sort()).toEqual([...TOOL_NAMES].sort());
-    expect(listed.tools).toHaveLength(13);
+    expect(listed.tools).toHaveLength(12);
+    expect(listed.tools.map(tool => tool.name)).not.toContain("live_output");
     const result = await mcp.callTool({ name: "ping", arguments: {} });
     expect(result.isError).toBeFalsy();
     expect(text(result)).toMatchObject({ status: "ok" });
@@ -61,7 +62,7 @@ describe("MCP server wiring", () => {
 
   it("returns the server error envelope as a structured tool error", async () => {
     const http = await stub(method => method === "ping"
-      ? { ok: true, data: { status: "ok", protocol_version: 2 } }
+      ? { ok: true, data: { status: "ok", protocol_version: 3 } }
       : { ok: false, error: { code: "session_not_found", message: "unknown session_id" } });
     cleanups.push(http.close);
     const mcp = await connect(http.baseUrl);
@@ -71,18 +72,19 @@ describe("MCP server wiring", () => {
   });
 
   it("rejects arguments the schema does not allow before calling the server", async () => {
-    const http = await stub(() => ({ ok: true, data: { status: "ok", protocol_version: 2 } }));
+    const http = await stub(() => ({ ok: true, data: { status: "ok", protocol_version: 3 } }));
     cleanups.push(http.close);
     const mcp = await connect(http.baseUrl);
-    const result = await mcp.callTool({ name: "live_output", arguments: { session_id: "s", offset: 3 } });
+    // `method_id` is no longer accepted by `authenticate`; the strict schema must reject it.
+    const result = await mcp.callTool({ name: "authenticate", arguments: { session_id: "s", method_id: "agent" } });
     expect(result.isError).toBe(true);
-    expect(http.requests).not.toContain("live_output");
+    expect(http.requests).not.toContain("authenticate");
   });
 
   it.each(["wait", "send_message"])("uses the correct abort policy for %s", async name => {
     let terminal = false;
     const http = await stub(method => {
-      if (method === "ping") return { ok: true, data: { status: "ok", protocol_version: 2 } };
+      if (method === "ping") return { ok: true, data: { status: "ok", protocol_version: 3 } };
       if (method === "send_message") return { ok: true, data: { message_id: "m1" } };
       return { ok: true, data: { session_id: "s1", message_id: "m1", state: terminal ? "completed" : "running", terminal, questions: [], result: terminal ? { text: "done" } : undefined } };
     });
@@ -108,7 +110,7 @@ describe("MCP server wiring", () => {
 
   it("flags a failed terminal message as a tool error while preserving its status", async () => {
     const http = await stub(method => {
-      if (method === "ping") return { ok: true, data: { status: "ok", protocol_version: 2 } };
+      if (method === "ping") return { ok: true, data: { status: "ok", protocol_version: 3 } };
       if (method === "send_message") return { ok: true, data: { message_id: "m1" } };
       return { ok: true, data: { session_id: "s1", message_id: "m1", state: "failed", terminal: true, questions: [], error: { code: "invalid_json", message: "bad harness output" }, result: { text: "", reasoning: "", tool_calls: [], stop_reason: null, raw_result: null } } };
     });
@@ -117,5 +119,64 @@ describe("MCP server wiring", () => {
     const result = await mcp.callTool({ name: "send_message", arguments: { session_id: "s1", text: "x" } });
     expect(result.isError).toBe(true);
     expect(text(result)).toMatchObject({ state: "failed", terminal: true, message_id: "m1", error: { code: "invalid_json" } });
+  });
+
+  it("marks a terminal status carrying an error as a tool error; a plain cancel is not", async () => {
+    let withError = true;
+    const http = await stub(method => {
+      if (method === "ping") return { ok: true, data: { status: "ok", protocol_version: 3 } };
+      return { ok: true, data: { session_id: "s1", message_id: "m1", state: "cancelled", terminal: true, questions: [], ...(withError ? { error: { code: "input_timeout", message: "authentication question timed out" } } : {}) } };
+    });
+    cleanups.push(http.close);
+    const mcp = await connect(http.baseUrl);
+    const failed = await mcp.callTool({ name: "wait", arguments: { session_id: "s1", message_id: "m1" } });
+    expect(failed.isError).toBe(true);
+    expect(text(failed)).toMatchObject({ state: "cancelled", error: { code: "input_timeout" } });
+
+    withError = false;
+    const plain = await mcp.callTool({ name: "wait", arguments: { session_id: "s1", message_id: "m1" } });
+    expect(plain.isError).toBeFalsy();
+    expect(text(plain)).toMatchObject({ state: "cancelled" });
+  });
+
+  it("flags a rate-limited authentication flow as a tool error while preserving its state", async () => {
+    const http = await stub(method => {
+      if (method === "ping") return { ok: true, data: { status: "ok", protocol_version: 3 } };
+      if (method === "authenticate") return { ok: true, data: { session_id: "s1", state: "authentication_rate_limited", terminal: true, questions: [], error: { code: "authentication_rate_limited", message: "rate limited", detail: { retry_after_seconds: 10 } } } };
+      return { ok: true, data: {} };
+    });
+    cleanups.push(http.close);
+    const mcp = await connect(http.baseUrl);
+    const result = await mcp.callTool({ name: "authenticate", arguments: { session_id: "s1" } });
+    expect(result.isError).toBe(true);
+    expect(text(result)).toMatchObject({ state: "authentication_rate_limited", terminal: true, error: { code: "authentication_rate_limited" } });
+  });
+
+  it("returns the authentication flow snapshot from the authenticate tool", async () => {
+    const http = await stub(method => {
+      if (method === "ping") return { ok: true, data: { status: "ok", protocol_version: 3 } };
+      if (method === "authenticate") return { ok: true, data: { session_id: "s1", state: "ready", terminal: true, questions: [], authenticated: true } };
+      return { ok: true, data: {} };
+    });
+    cleanups.push(http.close);
+    const mcp = await connect(http.baseUrl);
+    const result = await mcp.callTool({ name: "authenticate", arguments: { session_id: "s1" } });
+    expect(result.isError).toBeFalsy();
+    expect(text(result)).toMatchObject({ state: "ready", terminal: true, authenticated: true });
+  });
+
+  it("preserves the structured authentication_required envelope from create_session", async () => {
+    const detail = { session_id: "s-auth", next_action: { method: "authenticate", params: { session_id: "s-auth" } } };
+    const http = await stub(method => {
+      if (method === "ping") return { ok: true, data: { status: "ok", protocol_version: 3 } };
+      if (method === "create_session") return { ok: false, error: { code: "authentication_required", message: "Authentication is required.", detail } };
+      return { ok: true, data: {} };
+    });
+    cleanups.push(http.close);
+    const mcp = await connect(http.baseUrl);
+    const result = await mcp.callTool({ name: "create_session", arguments: { cwd: "/repo", model_id: "m" } });
+    expect(result.isError).toBe(true);
+    // The model-readable error retains session_id and next_action, not just the message.
+    expect(text(result)).toMatchObject({ ok: false, error: { code: "authentication_required", detail } });
   });
 });

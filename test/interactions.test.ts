@@ -64,4 +64,44 @@ describe("MCP elicitation handling", () => {
     const server = { server: { getClientCapabilities: () => ({ elicitation: { form: {} } }), elicitInput } } as unknown as McpServer;
     expect(await new ElicitationHandler(server, 1000).resolve(permission, signal())).toBeUndefined();
   });
+
+  it("elicits a boolean confirm question (URL/device-code) and rejects a value the harness did not offer", async () => {
+    const schema = { type: "object", properties: { opened: { type: "boolean", enum: [true] } }, required: ["opened"], additionalProperties: false };
+    const question = { ...permission, kind: "information" as const, options: [], schema };
+    const ok = handler({ elicitation: { form: {} } }, { action: "accept", content: { opened: true } });
+    expect(await ok.handler.resolve(question, signal())).toEqual({ answer: "accept", content: { opened: true } });
+    expect(ok.elicitInput).toHaveBeenCalled();
+    // A value outside the harness enum is refused (kept pending for a manual answer).
+    const bad = handler({ elicitation: { form: {} } }, { action: "accept", content: { opened: false } });
+    expect(await bad.handler.resolve(question, signal())).toBeUndefined();
+  });
+
+  it("elicits a method-selection question (string enum) and returns the user's chosen id", async () => {
+    const schema = { type: "object", properties: { method_id: { type: "string", enum: ["agent", "enterprise"] } }, required: ["method_id"], additionalProperties: false };
+    const { handler: instance } = handler({ elicitation: { form: {} } }, { action: "accept", content: { method_id: "enterprise" } });
+    expect(await instance.resolve({ ...permission, kind: "information", options: [], schema }, signal())).toEqual({ answer: "accept", content: { method_id: "enterprise" } });
+  });
+
+  it("enforces additionalProperties:false (ajv does not silently ignore it)", async () => {
+    const schema = { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false };
+    const { handler: instance } = handler({ elicitation: { form: {} } }, { action: "accept", content: { value: "x", extra: "y" } });
+    expect(await instance.resolve({ ...permission, kind: "information", options: [], schema }, signal())).toBeUndefined();
+  });
+
+  it("re-checks the signal after queueing so a superseded dialog never elicits", async () => {
+    let releaseFirst!: () => void;
+    const elicitInput = vi.fn(async () => { await new Promise<void>(resolve => { releaseFirst = resolve; }); return { action: "accept", content: { option_id: "allow_once" } }; });
+    const server = { server: { getClientCapabilities: () => ({ elicitation: { form: {} } }), elicitInput } } as unknown as McpServer;
+    const instance = new ElicitationHandler(server, 1000);
+    const first = instance.resolve(permission, signal());
+    await vi.waitFor(() => expect(elicitInput).toHaveBeenCalledTimes(1));
+    const controller = new AbortController();
+    const second = instance.resolve(permission, controller.signal);
+    controller.abort();
+    releaseFirst();
+    await first;
+    await expect(second).rejects.toThrow();
+    // The aborted, still-queued dialog never opened.
+    expect(elicitInput).toHaveBeenCalledTimes(1);
+  });
 });

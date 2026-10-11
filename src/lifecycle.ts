@@ -92,7 +92,7 @@ export class ServerLifecycle {
   async probe(): Promise<ProbeResult> {
     try {
       const data = await this.probeClient.call("ping", {});
-      return data.status === "ok" && data.protocol_version === 2 ? "ok" : "incompatible";
+      return data.status === "ok" && data.protocol_version === 3 ? "ok" : "incompatible";
     } catch (error) {
       // Only a refused/unreachable connection means "nothing is listening". Any answered
       // service — an error envelope, a slow response, or a non-bridge listener — is treated as
@@ -105,7 +105,7 @@ export class ServerLifecycle {
   private async probePid(): Promise<number | null> {
     try {
       const data = await this.probeClient.call("ping", {});
-      return data.status === "ok" && data.protocol_version === 2 && typeof data.pid === "number" ? data.pid : null;
+      return data.status === "ok" && data.protocol_version === 3 && typeof data.pid === "number" ? data.pid : null;
     } catch { return null; }
   }
 
@@ -123,7 +123,7 @@ export class ServerLifecycle {
   }
 
   private incompatible(): BridgeError {
-    return new BridgeError("incompatible_server", `a service at ${this.baseUrl} answered but is not a compatible harness-acp-bridge server (protocol 2)`);
+    return new BridgeError("incompatible_server", `a service at ${this.baseUrl} answered but is not a compatible harness-acp-bridge server (protocol 3)`);
   }
 
   private async startLocal(): Promise<EnsureResult> {

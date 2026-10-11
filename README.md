@@ -3,7 +3,7 @@
 Stdio [MCP](https://modelcontextprotocol.io) proxy for the
 [harness-acp-bridge server](https://github.com/black-94/harness-acp-bridge-server).
 
-It exposes the server's twelve HTTP operations as MCP tools. It owns no harness, state, or
+It exposes the server's eleven HTTP operations as MCP tools. It owns no harness, state, or
 scheduling: most tools are a single `POST /api/<name>`, while `send_message`/`wait` submit (or
 resume) once and then poll `message_status` until the message is terminal. If no compatible
 server is listening on the configured **loopback** address, the proxy starts the installed
@@ -53,8 +53,9 @@ anything but the configured server module through the managed path.
 
 ## Local server lifecycle
 
-1. `ping` the configured `baseUrl`. A server answering `ping` with `protocol_version: 2` is
-   reused as-is.
+1. `ping` the configured `baseUrl`. A server answering `ping` with `protocol_version: 3` is
+   reused as-is. An older protocol (e.g. a still-running `protocol_version: 2` daemon) is treated as
+   incompatible and **rejected**, but it is **never restarted, replaced, or killed**.
 2. If the address answered but is **not** a compatible bridge server (an error envelope, a
    different protocol version, or a non-JSON listener), the proxy reports `incompatible_server`
    and starts nothing — a foreign service is never treated as "absent".
@@ -76,7 +77,7 @@ anything but the configured server module through the managed path.
 
 ## Tools
 
-Twelve operations plus `wait`:
+Eleven operations plus `wait`:
 
 | Tool | Behavior |
 | --- | --- |
@@ -84,15 +85,30 @@ Twelve operations plus `wait`:
 | `search_harness` | Configured harnesses, models, thinking levels, permission modes. Starts nothing. |
 | `create_session` | Create a session-owned harness (`cwd`, `model_id`, plus optional launch fields). |
 | `close_session` | Stop the harness and close the session (idempotent). |
-| `authenticate` | Run the harness's own login and open the session. |
-| `auth_status` | Probe harness authentication (unsupported probes fail with original details). |
+| `authenticate` | Start or resume the harness authentication flow; the proxy elicits every question and polls until terminal. |
+| `auth_status` | Return the current authentication workflow shape, or probe harness authentication when no flow exists. |
 | `set_session_options` | Change `model_id` / `thinking_level` / `permission_mode` on an idle session. |
 | `send_message` | Submit a prompt and synchronously wait for the terminal result in this call. |
 | `cancel_message` | Cancel the active message and wait for it to settle. |
 | `message_status` | State, terminal flag, pending `questions`, unsupported events, errors, and result. |
-| `live_output` | Paged human-readable events with `cursor` / `limit` / `wait_ms`. |
-| `answer_question` | Answer a reverse request by `request_id` (`option_id` or object `content`). |
+| `answer_question` | Answer a reverse request by `session_id`/`request_id` (`option_id` or object `content`); `message_id` is omitted for session-auth questions. |
 | `wait` | Resume waiting for a known `session_id`/`message_id`; never resubmits. |
+
+### Authentication
+
+`authenticate` takes only `{ session_id }`; the proxy drives the flow and never lets the caller pick a
+method or a token. It elicits the server-provided `method_id` selection (the candidates, including the
+`Not supported in harness_acp_bridge` ones, are shown in the question message; only supported ids are
+offered), then elicits each follow-up question: the CodeBuddy “open this URL, then confirm”
+(`opened: boolean`), an Agy token, a Codex device code, and so on, in as many rounds as the server
+sends. Confirming a URL is **not** success — polling continues until the flow is terminal
+(`ready`/`failed`/`cancelled`; a rate limit is `authentication_rate_limited`). Each answer is sent as a
+session-scoped `answer_question` (no `message_id`) after re-checking the `request_id`. Without
+elicitation the tool returns `waiting_input` with the full `questions` for a manual `answer_question`
+followed by `authenticate`. Aborting only detaches the local wait; a decline/cancel/timeout is a real
+answer. `create_session` (and any op) that needs login returns a structured `authentication_required`
+error whose `detail` keeps `session_id` and `next_action` — the model then calls `authenticate`; the
+proxy never auto-authenticates.
 
 ### Reverse requests
 
@@ -106,13 +122,14 @@ and leaves the remote message running; a later `wait` can resume it. Aborting `s
 still cancels the remote message, matching the Pi client. Server timeout, question-answer,
 and JSONL error policies are unchanged.
 
-`live_output` is the only way to read incremental output; no preview is ever mixed into a
-result. `send_message`/`wait` return only the terminal status (whose `result` is the server's
-final answer). The proxy sends no progress notifications, so no output body leaks through them.
+There is no incremental-output tool (`live_output` is gone). `send_message`/`wait` return only the
+terminal status (whose `result` is the server's final answer); the proxy sends no progress
+notifications, so no output body leaks through them.
 
 Each success returns the server's `data` object as JSON text. A failure returns an MCP tool
 error (`isError: true`) whose text is the envelope
-`{ "ok": false, "error": { "code", "message", "detail" } }`, preserving the server error code.
+`{ "ok": false, "error": { "code", "message", "detail" } }`, preserving the server error code and
+its `detail` (including a structured `authentication_required`).
 
 ## Privacy
 
@@ -155,11 +172,14 @@ npm run check                 # clean + build + typecheck + tests
 npm pack --dry-run
 ```
 
-`npm run check` starts the real installed server package and its fake ACP harness (no paid
-model, Docker, or SSH) and drives it through real stdio MCP clients with and without elicitation
-capability, including autostart, reuse, answer+wait, cancel, and paging. Point
-`ACP_BRIDGE_SERVER_DIR` at a server checkout for the fake harness fixture (defaults to
-`../server`).
+`npm run check` starts a real server and its fake ACP harness (no paid model, Docker, or SSH) and
+drives it through real stdio MCP clients with and without elicitation capability, including
+autostart, reuse, answer+wait, cancel, and the authentication flow (unauthenticated
+`create_session` → method selection → URL/token answer → `auth_status` success). Integration and
+lifecycle suites resolve the in-repo server build (`../server/dist`) first and fall back to the
+installed package; because the client requires `protocol_version: 3`, they are skipped until the
+server is rebuilt with the new contract. Point `ACP_BRIDGE_SERVER_DIR` at a server checkout
+(defaults to `../server`).
 
 ## License
 

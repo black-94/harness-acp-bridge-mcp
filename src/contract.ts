@@ -1,5 +1,5 @@
 /**
- * The twelve bridge operations as MCP tools.
+ * The eleven bridge operations as MCP tools.
  *
  * These mirror the server's `POST /api/<name>` contract exactly (parameter names, types, and
  * semantics). Legacy names (`harness_info`, `auth_info`, `set_model`, `message_result`) and the
@@ -18,7 +18,6 @@ export const METHODS = [
   "send_message",
   "cancel_message",
   "message_status",
-  "live_output",
   "answer_question",
 ] as const;
 export type BridgeMethod = (typeof METHODS)[number];
@@ -47,7 +46,6 @@ const schemas: Record<BridgeMethod, z.ZodType> = {
       thinking_level: z.string().min(1).optional(),
       permission_mode: permissionMode.optional(),
       resume_session_id: z.string().min(1).optional(),
-      authenticate: z.string().min(1).optional(),
       session_id: z.string().min(1).optional(),
       target: z.enum(["local", "remote"]).optional(),
       remote_host: z.string().min(1).optional(),
@@ -61,7 +59,7 @@ const schemas: Record<BridgeMethod, z.ZodType> = {
     })
     .strict(),
   close_session: z.object({ session_id: z.string().min(1) }).strict(),
-  authenticate: z.object({ session_id: z.string().min(1), method_id: z.string().min(1) }).strict(),
+  authenticate: z.object({ session_id: z.string().min(1) }).strict(),
   auth_status: z.object({ session_id: z.string().min(1) }).strict(),
   set_session_options: z
     .object({
@@ -80,19 +78,10 @@ const schemas: Record<BridgeMethod, z.ZodType> = {
     .strict(),
   cancel_message: z.object({ session_id: z.string().min(1), message_id: z.string().min(1) }).strict(),
   message_status: z.object({ session_id: z.string().min(1), message_id: z.string().min(1) }).strict(),
-  live_output: z
-    .object({
-      session_id: z.string().min(1),
-      message_id: z.string().min(1).optional(),
-      cursor: z.string().optional(),
-      limit: z.number().int().min(1).optional(),
-      wait_ms: z.number().int().min(0).max(60000).optional(),
-    })
-    .strict(),
   answer_question: z
     .object({
       session_id: z.string().min(1),
-      message_id: z.string().min(1),
+      message_id: z.string().min(1).optional(),
       request_id: z.string().min(1),
       answer: z.enum(["accept", "reject", "timeout", "cancel"]).optional(),
       option_id: z.string().min(1).optional(),
@@ -136,7 +125,7 @@ export const TOOLS: BridgeTool[] = [
     name: "create_session",
     title: "Create session",
     description:
-      "Create a session-owned harness process. cwd and model_id are required. Optional harness, thinking_level, permission_mode, and launch fields (target/runtime/docker/resume/authenticate). Returns the session snapshot including session_id.",
+      "Create a session-owned harness process. cwd and model_id are required. Optional harness, thinking_level, permission_mode, and launch fields (target/runtime/docker/resume). Returns the session snapshot including session_id. If authentication is required, the structured error retains session_id and tells the model to call authenticate.",
     inputSchema: schemas.create_session,
     annotations: external,
   },
@@ -151,7 +140,7 @@ export const TOOLS: BridgeTool[] = [
     name: "authenticate",
     title: "Authenticate session",
     description:
-      "Authenticate the child harness (its own login, not HTTP client auth) and open its session. Same-target credential writes are serialized and optionally rate limited.",
+      "Start or resume the child harness authentication flow for session_id. The proxy elicits every server-provided question, submits answers without message_id, and polls until ready/failed/cancelled. Without elicitation it returns waiting_input for manual answer_question followed by authenticate. Aborting only detaches the local wait.",
     inputSchema: schemas.authenticate,
     annotations: external,
   },
@@ -159,7 +148,7 @@ export const TOOLS: BridgeTool[] = [
     name: "auth_status",
     title: "Authentication status",
     description:
-      "Probe the harness authentication state. An unsupported probe returns an unsupported_response error with original details; unknown authentication is never guessed as logged out.",
+      "Return the current authentication workflow shape when one exists; otherwise probe harness authentication. Unknown authentication is never guessed as logged out.",
     inputSchema: schemas.auth_status,
     annotations: external,
   },
@@ -196,18 +185,10 @@ export const TOOLS: BridgeTool[] = [
     annotations: external,
   },
   {
-    name: "live_output",
-    title: "Live output",
-    description:
-      "Page through human-readable journal events. Pass next_cursor back unchanged; cursors bind to the session and optional message filter. Always drain has_more, even when terminal is true; a complete:false event continues in the next fragment (join matching seq/type text fragments).",
-    inputSchema: schemas.live_output,
-    annotations: readOnly,
-  },
-  {
     name: "answer_question",
     title: "Answer question",
     description:
-      "Answer a pending reverse request by its request_id. answer defaults to accept. Permissions require an option_id offered by the harness; information and elicitation require an object content. Uses the harness's original RPC id.",
+      "Answer a pending reverse request by session_id/request_id. message_id is required for message questions and omitted for session authentication. answer defaults to accept. Permissions require an offered option_id; information and elicitation require object content.",
     inputSchema: schemas.answer_question,
     annotations: external,
   },

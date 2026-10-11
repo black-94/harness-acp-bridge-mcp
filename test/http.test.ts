@@ -81,7 +81,7 @@ describe("BridgeHttpClient", () => {
     })) as unknown as typeof fetch;
     const client = new BridgeHttpClient({ baseUrl: BASE, timeoutMs: 60_000, fetchImpl });
     const controller = new AbortController();
-    const pending = client.call("live_output", { session_id: "s", wait_ms: 60000 }, controller.signal);
+    const pending = client.call("message_status", { session_id: "s", message_id: "m" }, controller.signal);
     controller.abort();
     await expect(pending).rejects.toMatchObject({ code: "request_aborted" });
   });

@@ -46,7 +46,10 @@ const ajv = new Ajv({ strict: false, allErrors: true, validateFormats: true });
 /** Map a harness schema onto the restricted MCP form schema; null when it cannot be represented losslessly. */
 function toFormSchema(schema: Record<string, unknown> | null): FormSchema | null {
   if (!isRecord(schema) || schema.type !== "object" || !isRecord(schema.properties)) return null;
-  for (const key of Object.keys(schema)) if (!["type", "properties", "required"].includes(key)) return null;
+  // `additionalProperties: false` is compatible with the restricted form schema (which already
+  // forbids extra fields), and the server's auth question schemas set it.
+  for (const key of Object.keys(schema)) if (!["type", "properties", "required", "additionalProperties"].includes(key)) return null;
+  if (schema.additionalProperties !== undefined && schema.additionalProperties !== false) return null;
   const properties: Record<string, FormProperty> = {};
   for (const [key, value] of Object.entries(schema.properties)) {
     if (!isRecord(value)) return null;
@@ -68,7 +71,13 @@ function toFormSchema(schema: Record<string, unknown> | null): FormSchema | null
       }
       properties[key] = property;
     } else if (type === "boolean") {
-      if (keys.some(k => !BOOLEAN_KEYS.has(k))) return null;
+      // A `boolean` field may carry an `enum` (e.g. the auth URL/device-code confirm question uses
+      // `{ opened: { type: "boolean", enum: [true] } }`). The restricted form schema cannot express
+      // an enum on a boolean, so emit a plain boolean and keep the full-schema check in `form()`,
+      // which rejects a value the harness did not offer.
+      const extra = keys.filter(k => !BOOLEAN_KEYS.has(k));
+      if (extra.some(k => k !== "enum")) return null;
+      if (keys.includes("enum") && (!Array.isArray(value.enum) || !value.enum.every(item => typeof item === "boolean"))) return null;
       properties[key] = { type: "boolean", ...(typeof value.title === "string" ? { title: value.title } : {}), ...(typeof value.description === "string" ? { description: value.description } : {}) };
     } else if (type === "integer" || type === "number") {
       if (keys.some(k => !NUMBER_KEYS.has(k))) return null;
@@ -106,6 +115,8 @@ function isValidationError(error: unknown): boolean {
 }
 
 export class ElicitationHandler implements InteractionHandler {
+  private tail: Promise<unknown> = Promise.resolve();
+
   constructor(private readonly server: McpServer, private readonly timeoutMs: number) {}
 
   /**
@@ -120,15 +131,20 @@ export class ElicitationHandler implements InteractionHandler {
     return elicitation.url === undefined || elicitation.url === null; // legacy empty object defaults to form
   }
 
-  async resolve(question: Question, signal: AbortSignal): Promise<Decision | undefined> {
-    if (!this.supportsElicitation()) return undefined;
-    try {
-      return question.kind === "permission" ? await this.permission(question, signal) : await this.form(question, signal);
-    } catch (error) {
-      // An invalid elicitation answer leaves the question pending rather than failing the turn.
-      if (isValidationError(error)) return undefined;
-      throw error;
-    }
+  resolve(question: Question, signal: AbortSignal): Promise<Decision | undefined> {
+    if (!this.supportsElicitation()) return Promise.resolve(undefined);
+    const result = this.tail.catch(() => {}).then(async () => {
+      signal.throwIfAborted();
+      try {
+        return question.kind === "permission" ? await this.permission(question, signal) : await this.form(question, signal);
+      } catch (error) {
+        // An invalid elicitation answer leaves the question pending rather than failing the turn.
+        if (isValidationError(error)) return undefined;
+        throw error;
+      }
+    });
+    this.tail = result;
+    return result;
   }
 
   private async elicit(message: string, requestedSchema: FormSchema, signal: AbortSignal) {

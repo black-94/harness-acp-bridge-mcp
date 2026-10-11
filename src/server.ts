@@ -5,9 +5,10 @@ import { TOOLS, WAIT_TOOL, type BridgeMethod } from "./contract.js";
 import { BridgeHttpClient, errorInfo } from "./http.js";
 import { ServerLifecycle } from "./lifecycle.js";
 import { ElicitationHandler } from "./interactions.js";
+import { authenticateSession } from "./auth.js";
 import { waitForMessage, type MessageRef } from "./monitor.js";
 import { VERSION } from "./version.js";
-import type { McpSettings } from "./config.js";
+import { isRecord, type McpSettings } from "./config.js";
 
 export const SERVER_NAME = "harness-acp-bridge";
 const POLL_INTERVAL_MS = 150;
@@ -32,9 +33,11 @@ export function createBridgeMcpServer(settings: McpSettings): McpServer {
 
   const ok = (data: Record<string, unknown>) => ({ content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] });
   const fail = (error: unknown) => ({ isError: true, content: [{ type: "text" as const, text: JSON.stringify({ ok: false, error: errorInfo(error) }, null, 2) }] });
-  // A terminal status is returned as-is; only `failed` is also flagged as a tool error, so the
-  // model sees the failure while the authoritative status/result/error/message ref are preserved.
-  const status = (data: Record<string, unknown>) => (data.state === "failed" ? { ...ok(data), isError: true } : ok(data));
+  // A terminal status is a tool error when the turn failed OR carries an `error` object (e.g.
+  // cancelled/input_timeout, or a rate-limited auth flow). A plain user cancel with no error is a
+  // normal terminal result. The authoritative status/result/error/message ref are always preserved.
+  const isErrorStatus = (data: Record<string, unknown>): boolean => data.terminal === true && (data.state === "failed" || isRecord(data.error));
+  const status = (data: Record<string, unknown>) => (isErrorStatus(data) ? { ...ok(data), isError: true } : ok(data));
 
   const register = (name: string, config: ToolConfig, handler: ToolHandler): void => {
     server.registerTool(name, config, (async (args: Record<string, unknown>, extra: { signal: AbortSignal }) => {
@@ -54,6 +57,19 @@ export function createBridgeMcpServer(settings: McpSettings): McpServer {
         }
         const ref: MessageRef = { session_id: params.session_id, message_id: data.message_id };
         return status(await waitForMessage(client, interactions, ref, extra.signal, { pollIntervalMs: POLL_INTERVAL_MS }));
+      });
+      continue;
+    }
+    if (tool.name === "authenticate") {
+      // The proxy drives the interactive authentication workflow: it elicits every server-provided
+      // question through MCP elicitation (never choosing a method or a token for the user), sends
+      // each answer as a session-scoped answer_question, and polls to a terminal state. Aborting
+      // only detaches the local wait.
+      register(tool.name, config, async (params, extra) => {
+        await ensure();
+        if (typeof params.session_id !== "string") throw new Error("session_id is required");
+        const state = await authenticateSession(client, interactions, { session_id: params.session_id }, extra.signal, POLL_INTERVAL_MS);
+        return status(state);
       });
       continue;
     }
