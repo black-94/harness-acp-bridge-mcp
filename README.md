@@ -63,9 +63,14 @@ anything but the configured server module through the managed path.
 4. Starts are serialized with a per-address lock in the client directory, then re-checked, so
    two clients racing to start the same instance converge on one server (the server's own
    `state_dir` lock and port binding are the final backstop).
-5. The started server is detached with no inherited stdio. It survives the proxy and is **never
-   killed by it**, so it cannot tear down another client's sessions. It is recorded (pid + log
-   path) in `<client dir>/servers.json` for management; redacted diagnostics come from its log.
+5. The started server runs as a child of a **detached logging supervisor**. The supervisor holds
+   the server's real stdout/stderr fds as pipes and appends only redacted bytes to the log, so it
+   survives the proxy and is **never killed by it** — it cannot tear down another client's
+   sessions. `<client dir>/servers.json` records the actual server pid, the supervisor pid, and
+   the log path. Ownership is proven, not guessed: the proxy spawns the supervisor with a fresh
+   nonce and claims the server only when the answering ping pid equals the supervisor's recorded
+   `server_pid` and the private proof file carries that nonce. A peer that won the race is reused;
+   a foreign listener is never treated as absent and never killed.
 6. `shutdown`/`reload` release only the client's own transport. They never close server
    sessions or stop a reused instance.
 
@@ -106,6 +111,39 @@ final answer). The proxy sends no progress notifications, so no output body leak
 Each success returns the server's `data` object as JSON text. A failure returns an MCP tool
 error (`isError: true`) whose text is the envelope
 `{ "ok": false, "error": { "code", "message", "detail" } }`, preserving the server error code.
+
+## Privacy
+
+The proxy is a thin client: the real HTTP response is what it returns. It only sanitizes the
+**copies it persists**, and only common credential shapes.
+
+- The detached bootstrap is a **logging supervisor**: it launches the actual server with stdout
+  and stderr as **pipes** (never the log file) and redacts both streams — independently, with
+  bounded cross-chunk state — before appending to `server-<addr>.log`. Because the real fds are
+  pipes, every output path is covered: `console`, `stream.write`, **`fs.writeSync(1/2)`**,
+  `fs.writev`, native modules, dynamic-import and runtime diagnostics. A JS-level `write` patch
+  cannot see fd-level writes; the pipe boundary can.
+- Redaction lives entirely in the detached supervisor, never in the client, so it keeps working
+  after the client exits while the server stays alive. At EOF both held tails are flushed
+  (masked) before the log fd is closed, and existing log bytes are never rewritten (append only).
+- A redactor or disk error never falls back to raw bytes: a redactor exception drops the chunk,
+  and a disk write failure stops the owned server and exits non-zero rather than retrying forever
+  or letting the server block on a full pipe.
+- `logTail`/registry read-time masking is defense in depth only, never the security boundary.
+- `servers.json` is sanitized before its atomic write; the top-level map keys are base URLs
+  (already credential-free) and stay intact so registry and ownership lookups keep working. The
+  log file is mode 0600 in a mode-0700 client directory, and the launcher proof file is mode 0600.
+- Rules are the **canonical server files copied verbatim**: `src/redact-core.ts` and
+  `src/redact.ts` are byte-identical to `server/src/redact-core.ts`
+  (sha256 `b07ef16e39483b008c0f03e3da05dc194c87fa93080b53accf34317586d2a6c8`) and
+  `server/src/redact.ts` (sha256 `fa8e4bfedee21dd2c8014544cb8a9daacf8378c83fba874a8ad1714cf7fa450f`).
+  The build emits `dist/redact-core.js` + `dist/redact.js`, so nothing is hand-ported. To re-sync:
+  copy the two files over `src/` and rebuild.
+- A cross-package parity harness (`scripts/redaction-parity.mjs` at the repo root) loads the
+  server, MCP, and Pi modules and asserts byte-exact output for both the non-streaming and
+  streaming APIs across a representative battery (report: `/tmp/redaction-parity-final.log`).
+- Unknown/unrecognized text — including counters like `max_tokens` and ordinary CJK/emoji text —
+  is preserved verbatim. This is not a guarantee that every unknown secret is removed.
 
 ## Develop
 
