@@ -153,14 +153,14 @@ The proxy is a thin client: the real HTTP response is what it returns. It only s
   (already credential-free) and stay intact so registry and ownership lookups keep working. The
   log file is mode 0600 in a mode-0700 client directory, and the launcher proof file is mode 0600.
 - Rules are the **canonical server files copied verbatim**: `src/redact-core.ts` and
-  `src/redact.ts` are byte-identical to `server/src/redact-core.ts`
+  `src/redact.ts` are byte-identical to `server/src/redact/redact-core.ts`
   (sha256 `b07ef16e39483b008c0f03e3da05dc194c87fa93080b53accf34317586d2a6c8`) and
-  `server/src/redact.ts` (sha256 `fa8e4bfedee21dd2c8014544cb8a9daacf8378c83fba874a8ad1714cf7fa450f`).
-  The build emits `dist/redact-core.js` + `dist/redact.js`, so nothing is hand-ported. To re-sync:
-  copy the two files over `src/` and rebuild.
-- A cross-package parity harness (`scripts/tests/redaction-parity.mjs` at the repo root) loads the
-  server, MCP, and Pi modules and asserts byte-exact output for both the non-streaming and
-  streaming APIs across a representative battery (report: `/tmp/redaction-parity-final.log`).
+  `server/src/redact/redact.ts`. The build emits `dist/redact-core.js` + `dist/redact.js`, so
+  nothing is hand-ported. To re-sync: copy the two files over `src/` and rebuild.
+- A parity harness (`npm run parity`) loads this package's build and the sibling server build and
+  asserts byte-exact output for both the non-streaming and the streaming APIs across a
+  representative battery (report: `/tmp/redaction-parity-mcp.log`). The Pi extension pins itself
+  against the same server build with its own copy, so all three agree transitively.
 - Unknown/unrecognized text — including counters like `max_tokens` and ordinary CJK/emoji text —
   is preserved verbatim. This is not a guarantee that every unknown secret is removed.
 
