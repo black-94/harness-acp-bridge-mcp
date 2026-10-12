@@ -1,5 +1,5 @@
 import { createServer, type Server } from "node:http";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ServerLifecycle, redact } from "../src/lifecycle.ts";
 import type { McpSettings } from "../src/config.ts";
 import { ServerLifecycle as PiServerLifecycle } from "../../pi-extension/src/lifecycle.ts";
-import { bridgeConfig, freePort, killRegistryServers, newContractServerEntry, registry, serverAvailable } from "./support.ts";
+import { bridgeConfig, freePort, killRegistryServers, newContractServerCli, newContractServerEntry, registry, serverAvailable } from "./support.ts";
 
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup(); });
@@ -133,6 +133,26 @@ describe.runIf(serverAvailable())("managed local server lifecycle", () => {
     expect(await new ServerLifecycle(settings(baseUrl, clientDir, { configPath: config }), env).probe()).toBe("ok");
   });
 
+  it("does not run an inherited SERVER_COMMAND when an explicit module entry is selected", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mcp-life-"));
+    const port = await freePort();
+    const config = join(dir, "config.yaml");
+    writeFileSync(config, bridgeConfig(port, join(dir, "sessions")));
+    const clientDir = join(dir, "client");
+    const marker = join(dir, "hijack.marker");
+    const evil = join(dir, "evil-command.cjs");
+    writeFileSync(evil, `require("fs").writeFileSync(${JSON.stringify(marker)}, "ran");\n`);
+    chmodSync(evil, 0o755);
+    cleanups.push(() => { killRegistryServers(clientDir); rmSync(dir, { recursive: true, force: true }); });
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const env = { ...process.env, HARNESS_ACP_BRIDGE_CLIENT_DIR: clientDir, HARNESS_ACP_BRIDGE_SERVER_COMMAND: evil };
+
+    // `settings()` defaults to an explicit module entry, so the injected command must be cleared.
+    const result = await new ServerLifecycle(settings(baseUrl, clientDir, { configPath: config }), env).ensure();
+    expect(result).toMatchObject({ owned: true });
+    expect(existsSync(marker)).toBe(false);
+  });
+
   it("rejects a foreign listener that appears while the start lock is held", async () => {
     const dir = mkdtempSync(join(tmpdir(), "mcp-life-"));
     const clientDir = join(dir, "client");
@@ -175,5 +195,194 @@ describe.runIf(serverAvailable())("managed local server lifecycle", () => {
     expect(results.filter(result => result.owned)).toHaveLength(1);
     expect(results.every(result => result.baseUrl === baseUrl)).toBe(true);
     expect(Object.keys(registry(clientDir))).toEqual([baseUrl]);
+  });
+});
+
+function alive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
+}
+
+async function waitDead(pid: number, timeoutMs = 6000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) { if (!alive(pid)) return true; await new Promise(resolve => setTimeout(resolve, 25)); }
+  return !alive(pid);
+}
+
+describe.runIf(serverAvailable() && newContractServerCli() !== null)("managed local server via a PATH hacpd CLI", () => {
+  function cliSettings(baseUrl: string, clientDir: string, overrides: Partial<McpSettings> = {}): McpSettings {
+    return { baseUrl, timeoutMs: 15000, autoStart: true, serverEntry: null, configPath: null, startupTimeoutMs: 8000, ...overrides };
+  }
+  function fakeBin(dir: string, source: string): { bin: string; env: NodeJS.ProcessEnv } {
+    const target = newContractServerCli()!;
+    const bin = join(dir, "bin");
+    mkdirSync(bin);
+    if (source === "symlink") {
+      // Emulate an npm global bin: an *executable* Node script (the repo's dist/main.js is not
+      // chmod +x) reached through a symlink, whose realpath is followed and whose shebang lets the
+      // supervisor run it under `node --import <watchdog>`. The shim runs the real CLI in-process.
+      const shim = join(dir, "hacpd-shim.mjs");
+      writeFileSync(shim, `#!/usr/bin/env node\nimport(${JSON.stringify(pathToFileURL(target).href)});\n`, { mode: 0o755 });
+      symlinkSync(shim, join(bin, "hacpd"));
+    } else {
+      writeFileSync(join(bin, "hacpd"), source, { mode: 0o755 });
+    }
+    return { bin, env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}` } };
+  }
+  function configFor(dir: string, port: number): string {
+    const config = join(dir, "config.yaml");
+    writeFileSync(config, bridgeConfig(port, join(dir, "sessions")));
+    return config;
+  }
+  function serverRecord(clientDir: string, baseUrl: string): { pid: number; logger_pid: number } {
+    return registry(clientDir)[baseUrl] as unknown as { pid: number; logger_pid: number };
+  }
+
+  it("starts the real hacpd CLI, proves exact pid ownership, and reuses it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mcp-cli-"));
+    const clientDir = join(dir, "client");
+    const { env } = fakeBin(dir, "symlink");
+    const port = await freePort();
+    const config = configFor(dir, port);
+    const baseUrl = `http://127.0.0.1:${port}`;
+    cleanups.push(() => { killRegistryServers(clientDir); rmSync(dir, { recursive: true, force: true }); });
+    const withDir = { ...env, HARNESS_ACP_BRIDGE_CLIENT_DIR: clientDir };
+
+    const started = await new ServerLifecycle(cliSettings(baseUrl, clientDir, { configPath: config }), withDir).ensure();
+    expect(started).toMatchObject({ owned: true, baseUrl });
+    expect(started.pid).toBeGreaterThan(0);
+    // The answered ping pid is exactly the recorded server pid (the CLI process, not the supervisor).
+    expect(registry(clientDir)[baseUrl].pid).toBe(started.pid);
+    expect(registry(clientDir)[baseUrl].logger_pid).not.toBe(started.pid);
+    expect(await new ServerLifecycle(cliSettings(baseUrl, clientDir, { configPath: config }), withDir).ensure()).toMatchObject({ owned: false });
+    expect(await new ServerLifecycle(cliSettings(baseUrl, clientDir, { configPath: config }), withDir).probe()).toBe("ok");
+  });
+
+  it("converges concurrent command-mode starts on one instance (peer race)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mcp-cli-"));
+    const clientDir = join(dir, "client");
+    const { env } = fakeBin(dir, "symlink");
+    const port = await freePort();
+    const config = configFor(dir, port);
+    const baseUrl = `http://127.0.0.1:${port}`;
+    cleanups.push(() => { killRegistryServers(clientDir); rmSync(dir, { recursive: true, force: true }); });
+    const withDir = { ...env, HARNESS_ACP_BRIDGE_CLIENT_DIR: clientDir };
+
+    const results = await Promise.all([
+      new ServerLifecycle(cliSettings(baseUrl, clientDir, { configPath: config }), withDir).ensure(),
+      new ServerLifecycle(cliSettings(baseUrl, clientDir, { configPath: config }), withDir).ensure(),
+    ]);
+    expect(results.filter(result => result.owned)).toHaveLength(1);
+    expect(results.every(result => result.baseUrl === baseUrl)).toBe(true);
+    expect(Object.keys(registry(clientDir))).toEqual([baseUrl]);
+  });
+
+  it("does not orphan the CLI when the supervisor is SIGKILLed (stdin-EOF watchdog)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mcp-cli-"));
+    const clientDir = join(dir, "client");
+    const { env } = fakeBin(dir, "symlink");
+    const port = await freePort();
+    const config = configFor(dir, port);
+    const baseUrl = `http://127.0.0.1:${port}`;
+    cleanups.push(() => { killRegistryServers(clientDir); rmSync(dir, { recursive: true, force: true }); });
+    const withDir = { ...env, HARNESS_ACP_BRIDGE_CLIENT_DIR: clientDir };
+
+    const started = await new ServerLifecycle(cliSettings(baseUrl, clientDir, { configPath: config }), withDir).ensure();
+    const record = registry(clientDir)[baseUrl];
+    expect(record.pid).toBe(started.pid);
+    expect(record.logger_pid).toBeGreaterThan(0);
+    expect(alive(record.pid!)).toBe(true);
+
+    process.kill(record.logger_pid!, "SIGKILL");
+    expect(await waitDead(record.pid!)).toBe(true);
+  });
+
+  it("refuses a non-Node hacpd wrapper and never runs it unobserved", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mcp-cli-"));
+    const clientDir = join(dir, "client");
+    const { env } = fakeBin(dir, "#!/bin/sh\nexit 0\n");
+    const port = await freePort();
+    const config = configFor(dir, port);
+    const baseUrl = `http://127.0.0.1:${port}`;
+    cleanups.push(() => { killRegistryServers(clientDir); rmSync(dir, { recursive: true, force: true }); });
+    const withDir = { ...env, HARNESS_ACP_BRIDGE_CLIENT_DIR: clientDir };
+
+    let error: unknown;
+    try { await new ServerLifecycle(cliSettings(baseUrl, clientDir, { configPath: config }), withDir).ensure(); }
+    catch (cause) { error = cause; }
+    expect((error as { code?: string }).code).toBe("startup_failed");
+    expect(String(error)).toMatch(/Node script|supported server command/);
+    expect(registry(clientDir)).toEqual({});
+  });
+
+  it("hard-fails (no fallback) when a Node hacpd is found but never serves", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mcp-cli-"));
+    const clientDir = join(dir, "client");
+    const { env } = fakeBin(dir, "#!/usr/bin/env node\nprocess.exit(1)\n");
+    const port = await freePort();
+    const config = configFor(dir, port);
+    const baseUrl = `http://127.0.0.1:${port}`;
+    cleanups.push(() => { killRegistryServers(clientDir); rmSync(dir, { recursive: true, force: true }); });
+    const withDir = { ...env, HARNESS_ACP_BRIDGE_CLIENT_DIR: clientDir };
+
+    // A silent fallback to the installed (protocol-2) module would surface incompatible_server
+    // instead; startup_failed proves the explicitly-found command was used and its failure is final.
+    let error: unknown;
+    try { await new ServerLifecycle(cliSettings(baseUrl, clientDir, { configPath: config, startupTimeoutMs: 3000 }), withDir).ensure(); }
+    catch (cause) { error = cause; }
+    expect((error as { code?: string }).code).toBe("startup_failed");
+    expect(registry(clientDir)).toEqual({});
+  });
+
+  it("stops the CLI server and its supervisor when the server is SIGTERMed", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mcp-cli-"));
+    const clientDir = join(dir, "client");
+    const { env } = fakeBin(dir, "symlink");
+    const port = await freePort();
+    const config = configFor(dir, port);
+    const baseUrl = `http://127.0.0.1:${port}`;
+    cleanups.push(() => { killRegistryServers(clientDir); rmSync(dir, { recursive: true, force: true }); });
+    const withDir = { ...env, HARNESS_ACP_BRIDGE_CLIENT_DIR: clientDir };
+
+    await new ServerLifecycle(cliSettings(baseUrl, clientDir, { configPath: config }), withDir).ensure();
+    const record = serverRecord(clientDir, baseUrl);
+    process.kill(record.pid, "SIGTERM");
+    expect(await waitDead(record.pid)).toBe(true);
+    expect(await waitDead(record.logger_pid)).toBe(true);
+  });
+
+  it("stops the CLI server too when the supervisor is SIGTERMed", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mcp-cli-"));
+    const clientDir = join(dir, "client");
+    const { env } = fakeBin(dir, "symlink");
+    const port = await freePort();
+    const config = configFor(dir, port);
+    const baseUrl = `http://127.0.0.1:${port}`;
+    cleanups.push(() => { killRegistryServers(clientDir); rmSync(dir, { recursive: true, force: true }); });
+    const withDir = { ...env, HARNESS_ACP_BRIDGE_CLIENT_DIR: clientDir };
+
+    await new ServerLifecycle(cliSettings(baseUrl, clientDir, { configPath: config }), withDir).ensure();
+    const record = serverRecord(clientDir, baseUrl);
+    process.kill(record.logger_pid, "SIGTERM");
+    expect(await waitDead(record.logger_pid)).toBe(true);
+    expect(await waitDead(record.pid)).toBe(true);
+  });
+
+  it("does not import an inherited SERVER_MODULE when hacpd is selected", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mcp-cli-"));
+    const clientDir = join(dir, "client");
+    const { env } = fakeBin(dir, "symlink");
+    const port = await freePort();
+    const config = configFor(dir, port);
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const marker = join(dir, "hijack.marker");
+    const evilModule = join(dir, "evil-module.mjs");
+    writeFileSync(evilModule, `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, "ran");\n`);
+    cleanups.push(() => { killRegistryServers(clientDir); rmSync(dir, { recursive: true, force: true }); });
+    // Command mode is selected (PATH hacpd); the injected module entry must be cleared, not imported.
+    const withDir = { ...env, HARNESS_ACP_BRIDGE_CLIENT_DIR: clientDir, HARNESS_ACP_BRIDGE_SERVER_MODULE: evilModule };
+
+    const started = await new ServerLifecycle(cliSettings(baseUrl, clientDir, { configPath: config }), withDir).ensure();
+    expect(started).toMatchObject({ owned: true });
+    expect(existsSync(marker)).toBe(false);
   });
 });

@@ -6,8 +6,8 @@
  * argv pass-through: only the server URL, timing, and a managed server entry/config belong
  * here. Environment variables win over the JSON file.
  */
-import { readFileSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { accessSync, constants, readFileSync, realpathSync, statSync } from "node:fs";
+import { isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 export const DEFAULT_BASE_URL = "http://127.0.0.1:8787";
@@ -126,4 +126,53 @@ export function serverEntrySpecifier(entry: string, cwd: string): string | null 
   if (isAbsolute(entry)) return pathToFileURL(entry).href;
   if (entry.startsWith("./") || entry.startsWith("../")) return pathToFileURL(resolve(cwd, entry)).href;
   return null;
+}
+
+/**
+ * Locate an executable on `PATH`, resolved against the *client's* working directory.
+ *
+ * Every `PATH` entry is normalized first: an empty entry means the cwd (POSIX), and a relative
+ * entry is resolved against `cwd` — never the supervisor's own cwd. A candidate must be an
+ * executable *regular file*; a symlink is followed to its target (so a standard npm global
+ * `.bin` shim resolves to the real module). Nonexistent entries, directories, and
+ * non-executable files are skipped. Returns the real (symlink-resolved) path, or null.
+ *
+ * A missing `PATH` (undefined) means *no* probe — never the cwd — so an unset PATH can never make
+ * the client run a `hacpd` that happens to sit in the project. An explicit empty `PATH` keeps the
+ * POSIX meaning (each empty component is the cwd).
+ */
+export function findExecutable(name: string, env: NodeJS.ProcessEnv = process.env, cwd: string = process.cwd()): string | null {
+  if (env.PATH === undefined) return null;
+  for (const raw of env.PATH.split(":")) {
+    const dir = raw === "" ? cwd : isAbsolute(raw) ? raw : resolve(cwd, raw);
+    let real: string;
+    try { real = realpathSync(join(dir, name)); }
+    catch { continue; }
+    try {
+      if (!statSync(real).isFile()) continue;
+      accessSync(real, constants.X_OK);
+    } catch { continue; }
+    return real;
+  }
+  return null;
+}
+
+/**
+ * How to launch a local server: an importable module (`dist/index.js`-style server package), or
+ * the `hacpd` CLI found on `PATH`.
+ *
+ * Selection order (highest first): an explicit `serverEntry` (environment, then JSON) → `hacpd`
+ * on `PATH` → the installed server dependency. An explicit entry is final: it is never silently
+ * ignored, and a probe is never run behind it. The `hacpd` command is only ever the fixed PATH
+ * lookup — no caller-supplied command/args/env is accepted.
+ */
+export type ServerLaunch = { kind: "module"; specifier: string } | { kind: "command"; command: string };
+
+export function resolveServerLaunch(settings: Pick<McpSettings, "serverEntry">, env: NodeJS.ProcessEnv = process.env, cwd: string = process.cwd()): ServerLaunch {
+  if (settings.serverEntry !== null) {
+    return { kind: "module", specifier: serverEntrySpecifier(settings.serverEntry, cwd) ?? settings.serverEntry };
+  }
+  const hacpd = findExecutable("hacpd", env, cwd);
+  if (hacpd !== null) return { kind: "command", command: hacpd };
+  return { kind: "module", specifier: DEFAULT_SERVER_MODULE };
 }

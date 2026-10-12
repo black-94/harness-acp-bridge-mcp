@@ -22,7 +22,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BridgeError, BridgeHttpClient } from "./http.js";
 import { collectSecrets, redactText, redactValue } from "./redact.js";
-import { DEFAULT_SERVER_MODULE, isLoopback, serverEntrySpecifier, type McpSettings } from "./config.js";
+import { isLoopback, resolveServerLaunch, type McpSettings } from "./config.js";
 
 export interface EnsureResult {
   baseUrl: string;
@@ -76,6 +76,7 @@ export class ServerLifecycle {
   private readonly dir: string;
   private readonly baseUrl: string;
   private readonly settings: McpSettings;
+  private readonly env: NodeJS.ProcessEnv;
   private readonly baseCwd: string;
   private readonly secrets: readonly string[];
   private readonly probeClient: BridgeHttpClient;
@@ -84,6 +85,7 @@ export class ServerLifecycle {
     this.settings = settings;
     this.baseUrl = settings.baseUrl;
     this.dir = clientDirectory(env);
+    this.env = env;
     this.baseCwd = baseCwd;
     this.secrets = collectSecrets(env);
     this.probeClient = new BridgeHttpClient({ baseUrl: settings.baseUrl, timeoutMs: PROBE_TIMEOUT_MS });
@@ -143,17 +145,22 @@ export class ServerLifecycle {
       const nonce = randomBytes(16).toString("hex");
       try { unlinkSync(proofPath); } catch { /* no stale proof */ }
 
-      const entry = this.settings.serverEntry ?? DEFAULT_SERVER_MODULE;
-      const specifier = serverEntrySpecifier(entry, this.baseCwd) ?? entry;
+      // Resolve the entry once (explicit serverEntry → PATH hacpd → installed module) and pass
+      // exactly one kind-specific internal variable. Any inherited value of the other kind is
+      // cleared so a stray HARNESS_ACP_BRIDGE_SERVER_COMMAND in the environment can never hijack
+      // the spawn — only this fixed-name PATH lookup may select a command.
+      const plan = resolveServerLaunch(this.settings, this.env, this.baseCwd);
       const env: NodeJS.ProcessEnv = {
-        ...process.env,
-        HARNESS_ACP_BRIDGE_SERVER_MODULE: specifier,
+        ...this.env,
         HARNESS_ACP_BRIDGE_LOG: logPath,
         HARNESS_ACP_BRIDGE_PROOF: proofPath,
         HARNESS_ACP_BRIDGE_NONCE: nonce,
       };
+      delete env.HARNESS_ACP_BRIDGE_SERVER_MODULE;
+      delete env.HARNESS_ACP_BRIDGE_SERVER_COMMAND;
+      if (plan.kind === "module") env.HARNESS_ACP_BRIDGE_SERVER_MODULE = plan.specifier;
+      else env.HARNESS_ACP_BRIDGE_SERVER_COMMAND = plan.command;
       if (this.settings.configPath) env.HARNESS_ACP_BRIDGE_CONFIG = this.settings.configPath;
-
       const launch: Launch = { childPid: null, nonce, proofPath, logPath, spawnError: null };
       try {
         const child = spawn(process.execPath, [this.bootstrapPath()], { detached: true, stdio: "ignore", env, cwd: this.dir });

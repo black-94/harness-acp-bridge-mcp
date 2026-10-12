@@ -42,14 +42,51 @@ Environment variables win over the optional JSON file (`config.example.json`, se
 | `HARNESS_ACP_BRIDGE_URL` | `http://127.0.0.1:8787` | Base URL of the server. `http`/`https` only; no credentials, query, or fragment. |
 | `HARNESS_ACP_BRIDGE_TIMEOUT_MS` | `120000` | Per-request HTTP timeout. |
 | `HARNESS_ACP_BRIDGE_AUTOSTART` | `true` | Start a local server when the configured one is unreachable. |
-| `HARNESS_ACP_BRIDGE_SERVER_ENTRY` | installed dependency | Server module or path to load when starting a local server. A path is resolved against the proxy's startup cwd; a `file:` URL is used as-is. It must export `HarnessHttpServer`/`loadConfig` (the server package index), **not** a CLI such as `dist/main.js`. |
+| `HARNESS_ACP_BRIDGE_SERVER_ENTRY` | — | Explicit server **module** (or path / `file:` URL) to import when starting a local server. Must export `HarnessHttpServer`/`loadConfig` (the server package `index`), **not** the `hacpd` CLI (`dist/main.js`). A relative path is resolved against the proxy's startup cwd. When set it is final: it is never silently ignored, and no PATH/dependency fallback is probed. |
 | `HARNESS_ACP_BRIDGE_CONFIG` | — | Server YAML config path passed to the started server (also honored as a client setting). |
 | `HARNESS_ACP_BRIDGE_STARTUP_TIMEOUT_MS` | `30000` | How long to wait for a started server to answer `ping`. |
 | `HARNESS_ACP_BRIDGE_MCP_CONFIG` | — | Optional JSON settings file. |
 | `HARNESS_ACP_BRIDGE_CLIENT_DIR` | `~/.harness-acp-bridge-client` | Client-owned directory for the start lock, server log, and pid registry. |
 
+### Local-server entry selection
+
+When a local server must be started, the entry is chosen in this order:
+
+1. `HARNESS_ACP_BRIDGE_SERVER_ENTRY` / JSON `serverEntry` — an importable server module. Explicit
+   and final; a wrong value fails with `startup_failed` and is never silently skipped.
+2. `hacpd` found on `PATH` (a fixed-name lookup, never a caller-supplied command). A standard npm
+   global install exposes a `.bin` symlink to the package's `dist/main.js`; the proxy resolves the
+   symlink, and — because the CLI runs the server in-process and does not read stdin — starts it as
+   `node --import <bundled watchdog> <hacpd>` so the child PID is the answering server PID (exact
+   ownership proof) and a supervisor exit (including `SIGKILL`) reaches the server as a stdin EOF,
+   stopping it instead of orphaning it. The CLI's own module resolution is preserved.
+3. Otherwise the installed `@black942026/harness-acp-bridge-server` dependency's module entry.
+
+A `hacpd` that is **not** a Node script (any other shebang, e.g. a shell wrapper) cannot carry the
+in-process watchdog or give an exact PID, so it is refused with `startup_failed` (and the log says
+so) rather than run unobserved. A found `hacpd` that starts but never answers `ping`, or answers
+incompatibly, likewise fails hard — the resolver never switches to the next candidate after a
+startup failure. `PATH` entries that are empty mean the cwd and relative entries are resolved
+against the client's startup cwd (never the supervisor's); an **unset** `PATH` disables the
+`hacpd` probe entirely (it is never read as the cwd), so a project-local `hacpd` is never run by
+accident.
+
 The proxy never accepts a command or argv pass-through, so a caller cannot make it launch
-anything but the configured server module through the managed path.
+anything but the configured server module or the fixed `hacpd` PATH lookup through the managed
+path. The internal launch variables (`..._SERVER_MODULE` / `..._SERVER_COMMAND`) are cleared and
+exactly one is set per launch, so an inherited value cannot hijack the spawn.
+
+### Timeout keys (MCP ⇄ Pi)
+
+| Concept | MCP | Pi extension |
+| --- | --- | --- |
+| Per-request HTTP timeout | `timeoutMs` / `HARNESS_ACP_BRIDGE_TIMEOUT_MS` | `requestTimeoutMs` / `HARNESS_ACP_BRIDGE_TIMEOUT_MS` |
+| Startup wait (until `ping` answers) | `startupTimeoutMs` / `HARNESS_ACP_BRIDGE_STARTUP_TIMEOUT_MS` | `startupTimeoutMs` / `HARNESS_ACP_BRIDGE_STARTUP_TIMEOUT_MS` |
+
+Both clients share `HARNESS_ACP_BRIDGE_URL` / `_AUTOSTART` / `_SERVER_ENTRY` / `_CONFIG` /
+`_STARTUP_TIMEOUT_MS` / `_TIMEOUT_MS`, all with the same precedence: **environment > JSON >
+default**. Each keeps its own default timeout value. The Pi-only `interactionTimeoutMs` /
+`pollIntervalMs` have no shared environment variable.
 
 ## Local server lifecycle
 

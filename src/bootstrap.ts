@@ -26,7 +26,7 @@
  *  - At EOF the held tails of both streams are flushed (masked) before the log fd is closed.
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { closeSync, mkdirSync, openSync, renameSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readSync, renameSync, writeFileSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { collectSecrets, redactText, StreamRedactor } from "./redact.js";
@@ -46,10 +46,32 @@ if (!rawLogPath || !rawProofPath || !rawNonce) {
 const logPath: string = rawLogPath;
 const proofPath: string = rawProofPath;
 const nonce: string = rawNonce;
+/**
+ * Exactly one launch variable is set by the client: `..._SERVER_COMMAND` for a `hacpd` CLI found
+ * on PATH (a Node script we run as `node --import <watchdog> <command>`), otherwise
+ * `..._SERVER_MODULE` for an importable server module. Both are internal and never caller-supplied.
+ */
+const command = process.env.HARNESS_ACP_BRIDGE_SERVER_COMMAND;
 const entry = process.env.HARNESS_ACP_BRIDGE_SERVER_MODULE || DEFAULT_SERVER_MODULE;
 const configPath = process.env.HARNESS_ACP_BRIDGE_CONFIG;
 const runner = fileURLToPath(new URL("./server-runner.js", import.meta.url));
+// A `file:` URL specifier is safe for `--import` even when the installed path contains `#`, `?`,
+// or spaces (which would break a raw absolute path).
+const watchdog = new URL("./watchdog.js", import.meta.url).href;
 const secrets = collectSecrets(process.env);
+
+/** True only for a script Node can run with an injected preload (shebang mentioning `node`). */
+function isNodeScript(path: string): boolean {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, "r");
+    const head = Buffer.alloc(256);
+    const read = readSync(fd, head, 0, head.length, 0);
+    const first = head.subarray(0, read).toString("utf8").split("\n", 1)[0];
+    return /^#!.*\bnode\b/.test(first);
+  } catch { return false; }
+  finally { if (fd !== undefined) { try { closeSync(fd); } catch { /* ignore */ } } }
+}
 
 /**
  * Test-only fault injection; inert unless exactly one known value is set. Lets the acceptance
@@ -154,10 +176,31 @@ function goFatal(reason: string): void {
   backstop.unref();
 }
 
-const env: NodeJS.ProcessEnv = { ...process.env, HARNESS_ACP_BRIDGE_SERVER_MODULE: entry };
+const env: NodeJS.ProcessEnv = { ...process.env };
+if (command) {
+  // Never let an inherited module entry leak into command mode (and vice versa).
+  delete env.HARNESS_ACP_BRIDGE_SERVER_MODULE;
+} else {
+  env.HARNESS_ACP_BRIDGE_SERVER_MODULE = entry;
+}
 if (configPath) env.HARNESS_ACP_BRIDGE_CONFIG = configPath;
+
+if (command && !isNodeScript(command)) {
+  // A non-Node wrapper cannot carry the in-process stdin watchdog or give an exact server PID, so
+  // refuse loudly instead of running it unobserved. The client surfaces this as startup_failed.
+  writeProof(
+    `hacpd at ${command} is not a supported server command: the CLI must be a Node script ` +
+    `(a shebang line containing "node") so it can run under \`node --import <watchdog>\` with an ` +
+    `exact server PID. Install the official @black942026/harness-acp-bridge-server (npm bin), or ` +
+    `set HARNESS_ACP_BRIDGE_SERVER_ENTRY to the server module.`,
+  );
+  process.exit(1);
+}
+
 try {
-  child = spawn(process.execPath, [runner], { stdio: ["pipe", "pipe", "pipe"], env });
+  child = command
+    ? spawn(process.execPath, ["--import", watchdog, command], { stdio: ["pipe", "pipe", "pipe"], env })
+    : spawn(process.execPath, [runner], { stdio: ["pipe", "pipe", "pipe"], env });
 } catch (error) {
   writeProof(`could not spawn server: ${message(error)}`);
   process.exit(1);
