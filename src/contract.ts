@@ -1,12 +1,17 @@
 /**
- * The eleven bridge operations as MCP tools.
+ * The bridge operations as MCP tools.
  *
  * These mirror the server's `POST /api/<name>` contract exactly (parameter names, types, and
  * semantics). Legacy names (`harness_info`, `auth_info`, `set_model`, `message_result`) and the
  * old `mode`/`queue`/`steering` parameters and `offset` protocol are intentionally absent.
+ *
+ * A tool's `name` is model-facing; `method` is the server HTTP method it calls. They differ only
+ * for `create_template`, which is a client alias for the server's `register_template` operation
+ * (there is no `POST /api/create_template`). `delete_template` is deliberately not exposed.
  */
 import { z } from "zod";
 
+/** Server HTTP methods this proxy calls. `register_template` backs the `create_template` tool. */
 export const METHODS = [
   "ping",
   "search_harness",
@@ -19,44 +24,158 @@ export const METHODS = [
   "cancel_message",
   "message_status",
   "answer_question",
+  "register_template",
+  "search_template",
 ] as const;
 export type BridgeMethod = (typeof METHODS)[number];
 
 const permissionMode = z.enum(["read", "edit", "auto", "yolo"]);
+/** Every caller string that can reach an exec string must be NUL-free (the server enforces this too). */
+const noNul = (schema: z.ZodString): z.ZodString => schema.refine(value => !value.includes("\0"), "must not contain NUL");
+/**
+ * An environment map. zod's record parse silently DROPS an own `"__proto__"` key (it cannot
+ * represent it), while the server accepts every `[A-Za-z_][A-Za-z0-9_]*` name — so rather than lose
+ * a value the MCP client rejects such input explicitly (safe rejection, never a silent strip).
+ */
+const envField = z
+  .preprocess(
+    (raw) =>
+      raw !== null && typeof raw === "object" && !Array.isArray(raw) && Object.prototype.hasOwnProperty.call(raw, "__proto__")
+        ? "env must not contain a __proto__ key"
+        : raw,
+    z.record(
+      z.string().refine(key => !key.includes("\0"), "must not contain NUL"),
+      z.string().refine(value => !value.includes("\0"), "must not contain NUL"),
+    ),
+  )
+  .optional();
 const dockerMount = z
-  .object({ source: z.string().min(1), target: z.string().min(1), read_only: z.boolean().optional() })
+  .object({ source: noNul(z.string().min(1)), target: noNul(z.string().min(1)), read_only: z.boolean().optional() })
   .strict();
 const dockerPort = z
   .object({
     host_port: z.number().int().min(1).max(65535),
     container_port: z.number().int().min(1).max(65535),
     protocol: z.enum(["tcp", "udp"]).optional(),
-    host_ip: z.string().min(1).optional(),
+    // Nullable to match the server contract: a template searched with `host_ip: null` can be
+    // expanded into create_session without rewriting the field.
+    host_ip: noNul(z.string().min(1)).nullable().optional(),
   })
   .strict();
+// A template's port has the same nullable `host_ip` shape as create_session's.
+const templatePort = z
+  .object({
+    host_port: z.number().int().min(1).max(65535),
+    container_port: z.number().int().min(1).max(65535),
+    protocol: z.enum(["tcp", "udp"]).optional(),
+    host_ip: noNul(z.string()).nullable().optional(),
+  })
+  .strict();
+
+/**
+ * A launch template as accepted by `register_template` (`create_template`). Only the fields the
+ * server can actually register are accepted; unknown keys are rejected. `name` and `harness` are
+ * required; every other field is optional (the server applies defaults and rejects
+ * Docker fields on a `direct` template, a local `remote_host`, etc.). Persistence, argv
+ * validation, and duplicate-name rejection (`template_exists`, never an overwrite) are the
+ * server's responsibility.
+ */
+const launchTemplate = z
+  .object({
+    name: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
+    description: z.string().nullable().optional(),
+    harness: z.enum(["codebuddy", "codex", "agy"]),
+    runtime: z.enum(["direct", "docker"]).optional(),
+    target: z.enum(["local", "remote"]).optional(),
+    remote_host: noNul(z.string()).nullable().optional(),
+    permission_mode: permissionMode.optional(),
+    command: noNul(z.string()).nullable().optional(),
+    args: z.array(noNul(z.string())).optional(),
+    env: envField,
+    cwd: noNul(z.string()).nullable().optional(),
+    docker_image: noNul(z.string()).nullable().optional(),
+    container_policy: z.enum(["remove", "keep"]).optional(),
+    login_dirs: z.array(dockerMount).optional(),
+    mounts: z.array(dockerMount).optional(),
+    ports: z.array(templatePort).optional(),
+    host_network: z.boolean().optional(),
+  })
+  .strict();
+
+/**
+ * `create_session` fields shared by both variants. `cwd` and `model_id` are always required: a
+ * session is a direct call, never a template reference. The launch executable/argv/environment
+ * (`command`/`args`/`env`) and Docker-only `login_dirs` are direct session parameters.
+ */
+const createSessionBase = {
+  model_id: noNul(z.string().min(1)),
+  harness: noNul(z.string().min(1)).optional(),
+  command: noNul(z.string()).nullable().optional(),
+  args: z.array(noNul(z.string())).optional(),
+  env: envField,
+  thinking_level: noNul(z.string().min(1)).optional(),
+  permission_mode: permissionMode.optional(),
+  resume_session_id: noNul(z.string().min(1)).optional(),
+  session_id: noNul(z.string().min(1)).optional(),
+  target: z.enum(["local", "remote"]).optional(),
+  remote_host: noNul(z.string().min(1)).optional(),
+  runtime: z.enum(["direct", "docker"]).optional(),
+  // Nullable so a template's neutral defaults (`container_policy: null`, `docker_image: null`) can
+  // be expanded into create_session without rewriting the field.
+  container_policy: z.enum(["remove", "keep"]).nullable().optional(),
+  docker_id: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+  docker_image: noNul(z.string().min(1)).nullable().optional(),
+  login_dirs: z.array(dockerMount).optional(),
+  mounts: z.array(dockerMount).optional(),
+  ports: z.array(dockerPort).optional(),
+  host_network: z.boolean().optional(),
+} as const;
+
+/** True when any *effective* (non-neutral) Docker option is present. */
+function hasEffectiveDocker(data: Record<string, unknown>): boolean {
+  return (
+    typeof data.docker_image === "string" ||
+    data.docker_id !== undefined ||
+    (data.container_policy !== undefined && data.container_policy !== null) ||
+    (Array.isArray(data.mounts) && data.mounts.length > 0) ||
+    (Array.isArray(data.login_dirs) && data.login_dirs.length > 0) ||
+    (Array.isArray(data.ports) && data.ports.length > 0) ||
+    data.host_network === true
+  );
+}
 
 const schemas: Record<BridgeMethod, z.ZodType> = {
   ping: z.object({}).strict(),
   search_harness: z.object({ harness: z.string().min(1).optional() }).strict(),
+  // A single strict object (the MCP SDK exports only object schemas to the model, so a root union
+  // would arrive empty). `cwd` and `model_id` are required, there is no `template` parameter, and
+  // the object-level refinements enforce the key cross-field rules (all also enforced server-side):
+  // published ports exclude host networking, a reused container fixes its own Docker fields, and a
+  // direct runtime rejects *effective* Docker options while still accepting neutral defaults.
   create_session: z
-    .object({
-      cwd: z.string().min(1),
-      model_id: z.string().min(1),
-      harness: z.string().min(1).optional(),
-      thinking_level: z.string().min(1).optional(),
-      permission_mode: permissionMode.optional(),
-      resume_session_id: z.string().min(1).optional(),
-      session_id: z.string().min(1).optional(),
-      target: z.enum(["local", "remote"]).optional(),
-      remote_host: z.string().min(1).optional(),
-      runtime: z.enum(["direct", "docker"]).optional(),
-      container_policy: z.enum(["remove", "keep"]).optional(),
-      docker_id: z.string().regex(/^[0-9a-f]{64}$/).optional(),
-      docker_image: z.string().min(1).optional(),
-      mounts: z.array(dockerMount).optional(),
-      ports: z.array(dockerPort).optional(),
-      host_network: z.boolean().optional(),
+    .object({ ...createSessionBase, cwd: noNul(z.string().min(1)) })
+    .strict()
+    .refine(data => !(data.host_network === true && (data.ports?.length ?? 0) > 0), {
+      message: "host_network cannot be combined with published ports",
+      path: ["ports"],
     })
+    .refine(data => data.docker_id === undefined || !(
+      typeof data.docker_image === "string" ||
+      (data.mounts?.length ?? 0) > 0 ||
+      (data.login_dirs?.length ?? 0) > 0 ||
+      (data.ports?.length ?? 0) > 0 ||
+      data.host_network === true
+    ), {
+      message: "a reused container (docker_id) already fixes its image, mounts, ports, and network",
+      path: ["docker_id"],
+    })
+    .refine(data => data.runtime === "docker" || !hasEffectiveDocker(data), {
+      message: "container options require runtime=docker",
+      path: ["runtime"],
+    }),
+  register_template: z.object({ template: launchTemplate }).strict(),
+  search_template: z
+    .object({ name: z.string().min(1).optional(), query: z.string().min(1).optional(), harness: z.string().min(1).optional() })
     .strict(),
   close_session: z.object({ session_id: z.string().min(1) }).strict(),
   authenticate: z.object({ session_id: z.string().min(1) }).strict(),
@@ -91,20 +210,25 @@ const schemas: Record<BridgeMethod, z.ZodType> = {
 };
 
 export interface McpTool {
+  /** Model-facing tool name. */
   name: string;
+  /** Server HTTP method this tool calls: `POST /api/<method>`. */
+  method: BridgeMethod;
   title: string;
   description: string;
   inputSchema: z.ZodType;
-  /** MCP tool annotations; every bridge operation reaches an external harness process. */
+  /** MCP tool annotations. `external` reaches an external harness; template tools never do. */
   annotations: { openWorldHint: boolean; readOnlyHint?: boolean; destructiveHint?: boolean };
 }
 
-export type BridgeTool = McpTool & { name: BridgeMethod };
+export type BridgeTool = McpTool;
 
 const readOnly = { openWorldHint: false, readOnlyHint: true } as const;
 const external = { openWorldHint: true } as const;
+// Template registration is a private-server write that starts nothing; it never reaches a harness.
+const serverWrite = { openWorldHint: false, readOnlyHint: false, destructiveHint: false } as const;
 
-export const TOOLS: BridgeTool[] = [
+const toolDefs: Array<Omit<BridgeTool, "method"> & { method?: BridgeMethod }> = [
   {
     name: "ping",
     title: "Ping bridge",
@@ -122,10 +246,27 @@ export const TOOLS: BridgeTool[] = [
     annotations: readOnly,
   },
   {
+    name: "search_template",
+    title: "Search launch templates",
+    description:
+      "Find registered launch templates by exact name, free-text query (case-insensitive substring of name/harness/description), and/or harness. Returns each matching template in full, including its command/args/env/cwd/Docker defaults. Templates are INFORMATION ONLY: create_session never accepts a template name, so read the returned object and expand the allowed fields yourself when creating a session. Starts no harness.",
+    inputSchema: schemas.search_template,
+    annotations: readOnly,
+  },
+  {
+    name: "create_template",
+    method: "register_template",
+    title: "Create launch template",
+    description:
+      "Durably register a launch template (client alias for the server's register_template; it does not create a session and starts no harness). Supply {template: {...}} with name and harness plus any of description/runtime/target/remote_host/permission_mode/command/args/env/cwd/docker_image/container_policy/login_dirs/mounts/ports/host_network. A duplicate name is rejected (template_exists) and never overwrites the existing template. Collect the values with the user first (see the acp-create-template skill) and confirm the summary.",
+    inputSchema: schemas.register_template,
+    annotations: serverWrite,
+  },
+  {
     name: "create_session",
     title: "Create session",
     description:
-      "Create a session-owned harness process. cwd and model_id are required. Optional harness, thinking_level, permission_mode, and launch fields (target/runtime/docker/resume). Returns the session snapshot including session_id. If authentication is required, the structured error retains session_id and tells the model to call authenticate.",
+      "Create a session-owned harness process from explicit parameters. cwd and model_id are REQUIRED; there is no template parameter. Launch parameters: harness; command (absolute executable path or single executable name; empty/omitted uses the harness's built-in command) and args/env; permission_mode/thinking_level; target/remote_host; runtime and the Docker fields (docker_image for a new container, or docker_id to reuse; container_policy, login_dirs, mounts, ports, host_network). login_dirs and mounts are bind mounts used only for runtime=docker; login_dirs persist the harness's own credentials (not bridge credentials). To start from a template: search_template (exact name, else query/harness), read the returned object in full, DROP name/description and any field that does not apply (e.g. all Docker fields for a direct session), collect a model_id and any missing cwd from the user, apply the user's overrides, then pass only the allowed create_session fields — never pass template/name/description. Omit a field the template stores as null when null is not a valid session value (a local template's remote_host: null — pass remote_host only for a remote session; a null cwd — supply the user's cwd). When you override runtime or target, re-check that the remaining fields are still valid (e.g. Docker fields require docker; a remote target needs remote_host). Returns the session snapshot (no template identity). If authentication is required, the structured error carries session_id and a next_action telling you to call authenticate.",
     inputSchema: schemas.create_session,
     annotations: external,
   },
@@ -194,13 +335,20 @@ export const TOOLS: BridgeTool[] = [
   },
 ];
 
-export function schemaFor(method: BridgeMethod): z.ZodType {
-  return schemas[method];
+/** Tool name → HTTP method. Defaults to the tool name; `create_template` maps to `register_template`. */
+export const TOOLS: BridgeTool[] = toolDefs.map(def => ({ ...def, method: def.method ?? (def.name as BridgeMethod) }));
+
+/** The input schema for a model-facing tool name (not an HTTP method). */
+export function schemaFor(name: string): z.ZodType {
+  const tool = TOOLS.find(entry => entry.name === name) ?? (name === WAIT_TOOL.name ? WAIT_TOOL : undefined);
+  if (!tool) throw new Error(`unknown tool: ${name}`);
+  return tool.inputSchema;
 }
 
 /** Extra tool: resume waiting for a known message without submitting it again. */
 export const WAIT_TOOL: McpTool = {
   name: "wait",
+  method: "message_status",
   title: "Wait for message",
   description:
     "Wait for a previously submitted message by session_id/message_id without resubmitting it. Handles reverse requests through MCP elicitation when supported; otherwise returns waiting_input with the original question so the model can answer_question and wait again. Aborting only stops local waiting and leaves the remote message running; another wait can resume it.",

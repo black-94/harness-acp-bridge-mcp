@@ -15,32 +15,32 @@ export const mcpMain = resolve(here, "../dist/main.js");
  * (`../server/dist/index.js`) so integration runs against the in-repo server, and fall back to the
  * installed dependency when the parent checkout is absent (an isolated subrepo CI checkout).
  *
- * The client is protocol-3 only, so a build that still advertises protocol 2 is not usable; the
- * server-spawning suites are skipped until the server is rebuilt with the new contract rather than
- * silently running against the old installed dependency.
+ * The client is protocol-4 only, so a build that still advertises an older protocol is not usable;
+ * the server-spawning suites are skipped until the server is rebuilt with the new contract rather
+ * than silently running against the old installed dependency.
  */
-function distIsProtocol3(distRoot: string): boolean {
-  try { return /PROTOCOL_VERSION\s*=\s*3\b|protocol_version:\s*3\b/.test(readFileSync(join(distRoot, "logic", "service.js"), "utf8")); }
+function distIsProtocol4(distRoot: string): boolean {
+  try { return /PROTOCOL_VERSION\s*=\s*4\b|protocol_version:\s*4\b/.test(readFileSync(join(distRoot, "logic", "service.js"), "utf8")); }
   catch { return false; }
 }
 
 export function newContractServerEntry(): string | null {
   const repo = join(serverDir, "dist");
-  if (distIsProtocol3(repo)) return join(repo, "index.js");
+  if (distIsProtocol4(repo)) return join(repo, "index.js");
   const installed = join(here, "..", "node_modules", "@black942026", "harness-acp-bridge-server", "dist");
-  if (distIsProtocol3(installed)) return join(installed, "index.js");
+  if (distIsProtocol4(installed)) return join(installed, "index.js");
   return null;
 }
 
 /**
- * The `hacpd` CLI of a protocol-3 build (`dist/main.js`), for exercising the PATH-command launch
- * path. Returns null when no protocol-3 build is present (the command suites then skip).
+ * The `hacpd` CLI of a protocol-4 build (`dist/main.js`), for exercising the PATH-command launch
+ * path. Returns null when no protocol-4 build is present (the command suites then skip).
  */
 export function newContractServerCli(): string | null {
   const repo = join(serverDir, "dist");
-  if (distIsProtocol3(repo) && existsSync(join(repo, "main.js"))) return join(repo, "main.js");
+  if (distIsProtocol4(repo) && existsSync(join(repo, "main.js"))) return join(repo, "main.js");
   const installed = join(here, "..", "node_modules", "@black942026", "harness-acp-bridge-server", "dist");
-  if (distIsProtocol3(installed) && existsSync(join(installed, "main.js"))) return join(installed, "main.js");
+  if (distIsProtocol4(installed) && existsSync(join(installed, "main.js"))) return join(installed, "main.js");
   return null;
 }
 
@@ -57,6 +57,11 @@ export async function freePort(): Promise<number> {
   return port;
 }
 
+/**
+ * A valid protocol-4 server config. Harness commands are no longer configuration: they come from an
+ * explicit `command`/`args`/`env` or the target PATH (the integration suite installs PATH wrappers
+ * around the fake harness). Only models are declared here.
+ */
 export function bridgeConfig(port: number, stateDir: string): string {
   return JSON.stringify({
     schema_version: 2,
@@ -67,19 +72,11 @@ export function bridgeConfig(port: number, stateDir: string): string {
     authentication: { rate_limit: { enabled: false } },
     default_harness: "codebuddy",
     harnesses: {
-      codebuddy: {
-        command: process.execPath,
-        args: [fakeHarness],
-        models: [{ id: "fake-model", thinking_levels: ["low", "high"] }, { id: "fake-model-2" }],
-      },
+      codebuddy: { models: [{ id: "fake-model", thinking_levels: ["low", "high"] }, { id: "fake-model-2" }] },
       // The built-in `codex` adapter drives the fake harness's device-code URL elicitation, so the
       // auth e2e exercises the real CodexAdapter normalization (server harness names are the fixed
       // built-in `codebuddy`/`codex`/`agy`; there is no custom alias).
-      codex: {
-        command: process.execPath,
-        args: [fakeHarness, "--auth-methods"],
-        models: [{ id: "fake-model" }],
-      },
+      codex: { models: [{ id: "fake-model" }] },
     },
   });
 }

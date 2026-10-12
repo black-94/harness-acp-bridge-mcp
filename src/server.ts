@@ -1,7 +1,7 @@
 /** MCP server assembly: bridge operations as tools, with synchronous send/wait. */
 import { McpServer, type ToolCallback } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ZodType } from "zod";
-import { TOOLS, WAIT_TOOL, type BridgeMethod } from "./contract.js";
+import { TOOLS, WAIT_TOOL } from "./contract.js";
 import { BridgeHttpClient, errorInfo } from "./http.js";
 import { ServerLifecycle } from "./lifecycle.js";
 import { ElicitationHandler } from "./interactions.js";
@@ -75,7 +75,8 @@ export function createBridgeMcpServer(settings: McpSettings): McpServer {
     }
     register(tool.name, config, async (args, extra) => {
       await ensure();
-      return ok(await client.call(tool.name as BridgeMethod, args, extra.signal));
+      // `tool.name` is model-facing; `tool.method` is the HTTP method (`create_template` → register_template).
+      return ok(await client.call(tool.method, args, extra.signal));
     });
   }
 

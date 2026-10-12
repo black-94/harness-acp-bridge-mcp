@@ -3,12 +3,13 @@
 Stdio [MCP](https://modelcontextprotocol.io) proxy for the
 [harness-acp-bridge server](https://github.com/black-94/harness-acp-bridge-server).
 
-It exposes the server's eleven HTTP operations as MCP tools. It owns no harness, state, or
+It exposes the server's HTTP operations as MCP tools. It owns no harness, state, or
 scheduling: most tools are a single `POST /api/<name>`, while `send_message`/`wait` submit (or
 resume) once and then poll `message_status` until the message is terminal. If no compatible
 server is listening on the configured **loopback** address, the proxy starts the installed
 server package as a managed background service and reuses it. Harness processes, scheduling,
-persistence, SSH/Docker launch, and authentication all remain the server's responsibility.
+persistence, SSH/Docker launch, template storage, and authentication all remain the server's
+responsibility.
 
 ```text
 MCP client --stdio JSON-RPC--> this proxy --HTTP POST /api/<name>--> bridge server
@@ -90,8 +91,9 @@ default**. Each keeps its own default timeout value. The Pi-only `interactionTim
 
 ## Local server lifecycle
 
-1. `ping` the configured `baseUrl`. A server answering `ping` with `protocol_version: 3` is
-   reused as-is. An older protocol (e.g. a still-running `protocol_version: 2` daemon) is treated as
+1. `ping` the configured `baseUrl`. A server answering `ping` with `protocol_version: 4` is
+   reused as-is. An older protocol (e.g. a still-running `protocol_version: 3` daemon, whose
+   `create_session` still referenced a template) is treated as
    incompatible and **rejected**, but it is **never restarted, replaced, or killed**.
 2. If the address answered but is **not** a compatible bridge server (an error envelope, a
    different protocol version, or a non-JSON listener), the proxy reports `incompatible_server`
@@ -114,13 +116,15 @@ default**. Each keeps its own default timeout value. The Pi-only `interactionTim
 
 ## Tools
 
-Eleven operations plus `wait`:
+Eleven operations plus `search_template`, `create_template`, and `wait`:
 
 | Tool | Behavior |
 | --- | --- |
 | `ping` | Liveness, protocol version, PID, uptime, live session count, config fingerprint. |
 | `search_harness` | Configured harnesses, models, thinking levels, permission modes. Starts nothing. |
-| `create_session` | Create a session-owned harness (`cwd`, `model_id`, plus optional launch fields). |
+| `search_template` | Find launch templates by exact `name`, `query` (case-insensitive substring of name/harness/description), and/or `harness`; returns each match in full. Starts nothing. |
+| `create_template` | Durably register a launch template from `{template: {...}}`. A **client alias** for the server's `register_template` — there is no `POST /api/create_template`. Duplicate names are rejected (`template_exists`) and never overwritten. Starts nothing. |
+| `create_session` | Create a session-owned harness from explicit parameters: required `model_id` and `cwd`, plus optional `harness`, `command`/`args`/`env`, `thinking_level`, `permission_mode`, `target`/`remote_host`, `runtime`, and the Docker fields (`docker_image` or `docker_id`, `container_policy`, `login_dirs`, `mounts`, `ports`, `host_network`). There is **no** `template` parameter. |
 | `close_session` | Stop the harness and close the session (idempotent). |
 | `authenticate` | Start or resume the harness authentication flow; the proxy elicits every question and polls until terminal. |
 | `auth_status` | Return the current authentication workflow shape, or probe harness authentication when no flow exists. |
@@ -130,6 +134,40 @@ Eleven operations plus `wait`:
 | `message_status` | State, terminal flag, pending `questions`, unsupported events, errors, and result. |
 | `answer_question` | Answer a reverse request by `session_id`/`request_id` (`option_id` or object `content`); `message_id` is omitted for session-auth questions. |
 | `wait` | Resume waiting for a known `session_id`/`message_id`; never resubmits. |
+
+`create_template`/`search_template` carry MCP annotations that reflect reality: both have
+`openWorldHint: false` (neither reaches a harness); `search_template` is `readOnlyHint: true`, and
+`create_template` is a non-destructive server write (`readOnlyHint: false`, `destructiveHint:
+false`, since a duplicate name is rejected rather than overwritten). `delete_template` is
+deliberately **not** exposed as a tool.
+
+### Launch templates
+
+The server stores launch templates (command/argv/env/Docker defaults), but templates are
+**information only**: `create_session` never references one. The intended workflow:
+
+1. The user names or describes a template. Call `search_template` with an exact `name` when
+   known, otherwise with `query`/`harness`. If several match, ask the user which one before
+   proceeding.
+2. Read the returned template's full content — the proxy never guesses it.
+3. Drop `name`/`description` and every field that does not apply to the session you are creating
+   (e.g. all Docker fields for a direct session), then collect the missing values from the user:
+   `model_id` is **always required** (templates store no model or thinking level), plus any `cwd`
+   the template does not provide and any explicit overrides. Omit a field the template stores as
+   `null` when `null` is not a valid session value (a local `remote_host`, a `null` `cwd`).
+4. Call `create_session` with those **explicit** parameters — never `template`/`name`/`description`,
+   which the strict schema rejects. When you override `runtime`/`target`, re-check the combination
+   (Docker fields require `runtime: docker`; a remote target needs `remote_host`). The proxy never
+   merges or re-implements template defaults for you.
+
+To create a template, call `create_template` with a `{template: {...}}` object. Only the fields
+the server can register are accepted: `name` (required), `harness` (required), and optional
+`description`, `runtime`, `target`, `remote_host`, `permission_mode`, `command`, `args`, `env`,
+`cwd`, `docker_image`, `container_policy`, `login_dirs`, `mounts`, `ports`, `host_network`.
+Unknown fields are rejected. Prefer collecting and confirming the values with the user first; the
+`acp-create-template` skill (published with the Pi extension package, and portable to MCP hosts)
+documents that interview. Registering a template never creates or starts a session.
+
 
 ### Authentication
 
@@ -211,10 +249,17 @@ npm pack --dry-run
 
 `npm run check` starts a real server and its fake ACP harness (no paid model, Docker, or SSH) and
 drives it through real stdio MCP clients with and without elicitation capability, including
-autostart, reuse, answer+wait, cancel, and the authentication flow (unauthenticated
-`create_session` → method selection → URL/token answer → `auth_status` success). Integration and
+autostart, reuse, answer+wait, cancel, the authentication flow (unauthenticated
+`create_session` → method selection → URL/token answer → `auth_status` success), and the template
+flow (`create_template` → `search_template` by name/query/harness → expand the allowed fields into
+an explicit `create_session` with an inherited-then-overridden cwd and command/args/env, plus
+duplicate/invalid/unknown templates and client-side rejection of a missing cwd, a `template`
+reference, or launch internals). Harness
+commands come from the explicit `command`/`args`/`env` or the execution target's `PATH`, so the
+integration suite installs PATH wrappers around the fake harness for the template-less cases.
+Integration and
 lifecycle suites resolve the in-repo server build (`../server/dist`) first and fall back to the
-installed package; because the client requires `protocol_version: 3`, they are skipped until the
+installed package; because the client requires `protocol_version: 4`, they are skipped until the
 server is rebuilt with the new contract. Point `ACP_BRIDGE_SERVER_DIR` at a server checkout
 (defaults to `../server`).
 

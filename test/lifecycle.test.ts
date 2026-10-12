@@ -63,6 +63,23 @@ describe("protocol compatibility (no server spawn)", () => {
     const response = await fetch(`http://127.0.0.1:${port}/api/ping`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
     expect((await response.json() as { ok: boolean }).ok).toBe(true);
   });
+
+  it("refuses a still-running protocol-3 daemon without restarting or killing it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mcp-life-"));
+    const port = await freePort();
+    // The previous public contract: an occupied listener on protocol 3 must be refused, never taken
+    // over, restarted, or killed by the client.
+    const listener = await stubListener(port, 3);
+    cleanups.push(() => new Promise<void>(resolve => listener.close(() => resolve())));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const clientDir = join(dir, "client");
+    const lifecycle = new ServerLifecycle(settings(`http://127.0.0.1:${port}`, clientDir), { ...process.env, HARNESS_ACP_BRIDGE_CLIENT_DIR: clientDir });
+    expect(await lifecycle.probe()).toBe("incompatible");
+    await expect(lifecycle.ensure()).rejects.toMatchObject({ code: "incompatible_server" });
+    expect(registry(clientDir)).toEqual({});
+    const response = await fetch(`http://127.0.0.1:${port}/api/ping`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    expect((await response.json() as { ok: boolean }).ok).toBe(true);
+  });
 });
 
 describe.runIf(serverAvailable())("managed local server lifecycle", () => {

@@ -3,14 +3,14 @@
  * server it starts on demand (the installed server dependency), and the server's fake ACP
  * harness. Skips when the proxy or the server fixture is not built. No paid model/Docker/SSH.
  */
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { bridgeConfig, freePort, killRegistryServers, mcpMain, newContractServerEntry, registry, serverAvailable } from "./support.ts";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { bridgeConfig, fakeHarness, freePort, killRegistryServers, mcpMain, newContractServerEntry, registry, serverAvailable } from "./support.ts";
 
 interface CallResult { content?: Array<{ type?: string; text?: string }>; isError?: boolean }
 function payload(result: CallResult): any {
@@ -74,28 +74,39 @@ describe.runIf(serverAvailable())("MCP proxy with autostart, elicitation and syn
     clientDir = join(dir, "client");
     const port = await freePort();
     writeFileSync(join(dir, "config.yaml"), bridgeConfig(port, join(dir, "sessions")));
+    // Harness commands come from the explicit command/args/env or the execution target's PATH.
+    // Install PATH wrappers around the fake harness so a command-less create_session still resolves.
+    const bin = join(dir, "bin");
+    mkdirSync(bin);
+    const quote = (value: string): string => `'${value.replace(/'/g, "'\\''")}'`;
+    for (const [command, flags] of [["codebuddy", ""], ["codex-acp", "--fake-agent=codex --auth-methods"]]) {
+      writeFileSync(join(bin, command), `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(fakeHarness)} ${flags} "$@"\n`, { mode: 0o755 });
+    }
+    vi.stubEnv("PATH", `${bin}:${process.env.PATH ?? ""}`);
     baseUrl = `http://127.0.0.1:${port}`;
     ({ client: capable, transport: capableTransport } = await connectProxy(true));
   }, 40000);
 
   afterAll(async () => {
+    vi.unstubAllEnvs();
     await capable?.close().catch(() => {});
     killRegistryServers(clientDir);
     // The detached server keeps writing its log briefly after SIGTERM; retry the recursive remove.
     if (dir) rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
-  it("lists the eleven operations plus wait", async () => {
+  it("lists the eleven operations plus the two template tools and wait", async () => {
     const listed = await capable.listTools();
     expect(listed.tools.map(tool => tool.name).sort()).toEqual([
       "answer_question", "auth_status", "authenticate", "cancel_message", "close_session", "create_session",
-      "message_status", "ping", "search_harness", "send_message", "set_session_options", "wait",
+      "create_template", "message_status", "ping", "search_harness", "search_template",
+      "send_message", "set_session_options", "wait",
     ]);
   });
 
   it("autostarts the local server when none is running, then pings it", async () => {
     expect(registry(clientDir)).toEqual({});
-    expect(await call(capable, "ping")).toMatchObject({ status: "ok", protocol_version: 3 });
+    expect(await call(capable, "ping")).toMatchObject({ status: "ok", protocol_version: 4 });
     expect(Object.keys(registry(clientDir))).toEqual([baseUrl]);
     expect(await call(capable, "search_harness")).toHaveProperty("harnesses.codebuddy");
   });
@@ -105,6 +116,136 @@ describe.runIf(serverAvailable())("MCP proxy with autostart, elicitation and syn
     const status = await call(capable, "send_message", { session_id: session, text: "hello 中文😀" });
     expect(status.terminal).toBe(true);
     expect(status.result.text).toBe("echo:hello 中文😀");
+  });
+
+  it("registers and searches a template without starting a harness", async () => {
+    const sessionDirs = (): string[] => readdirSync(join(dir, "sessions"), { withFileTypes: true }).filter(entry => entry.isDirectory()).map(entry => entry.name).sort();
+    const before = sessionDirs();
+    const created = await call(capable, "create_template", {
+      template: { name: "mcp-local", harness: "codebuddy", description: "local direct", cwd: dir },
+    });
+    // The server applies defaults and returns the full template; no session was created.
+    expect(created.template).toMatchObject({
+      name: "mcp-local", harness: "codebuddy", runtime: "direct", target: "local",
+      cwd: dir, permission_mode: "auto", args: [], env: {}, mounts: [], ports: [], host_network: false,
+    });
+    expect(created.session_id).toBeUndefined();
+    // Registering a template creates no session directory (templates.json is not a session).
+    expect(sessionDirs()).toEqual(before);
+
+    // Exact name, case-insensitive query, and harness all find it, with the full content.
+    const byName = await call(capable, "search_template", { name: "mcp-local" });
+    expect(byName.templates).toHaveLength(1);
+    expect(byName.templates[0]).toMatchObject({ name: "mcp-local", cwd: dir, permission_mode: "auto", command: null, docker_image: null });
+    expect((await call(capable, "search_template", { query: "MCP-LOCAL" })).templates.map((t: { name: string }) => t.name)).toContain("mcp-local");
+    expect((await call(capable, "search_template", { query: "direct" })).templates.map((t: { name: string }) => t.name)).toContain("mcp-local");
+    expect((await call(capable, "search_template", { harness: "codebuddy" })).templates.map((t: { name: string }) => t.name)).toContain("mcp-local");
+    expect((await call(capable, "search_template", { harness: "codex" })).templates.map((t: { name: string }) => t.name)).not.toContain("mcp-local");
+    expect((await call(capable, "search_template", { name: "nope" })).templates).toHaveLength(0);
+    // Searching also starts nothing.
+    expect(sessionDirs()).toEqual(before);
+  });
+
+  it("rejects a duplicate template name instead of overwriting it", async () => {
+    const duplicate = await capable.callTool({ name: "create_template", arguments: {
+      template: { name: "mcp-local", harness: "codebuddy", description: "changed", cwd: "/elsewhere" },
+    } });
+    expect(duplicate.isError).toBe(true);
+    expect(payload(duplicate)).toMatchObject({ ok: false, error: { code: "template_exists" } });
+    // The original template is untouched.
+    const found = (await call(capable, "search_template", { name: "mcp-local" })).templates[0];
+    expect(found).toMatchObject({ description: "local direct", cwd: dir });
+  });
+
+  it("expands a searched template into explicit create_session parameters (no template/meta) and honors a cwd override", async () => {
+    // A distinct existing absolute directory, so an override cannot be confused with inheritance.
+    const overrideDir = join(dir, "override-cwd");
+    mkdirSync(overrideDir, { recursive: true });
+
+    // LLM-style expansion: read the template, then hand-pick only the fields create_session accepts,
+    // dropping name/description and every field that does not apply.
+    const template = (await call(capable, "search_template", { name: "mcp-local" })).templates[0];
+    const expand = (overrides: Record<string, unknown>): Record<string, unknown> => ({
+      harness: template.harness, runtime: template.runtime, target: template.target,
+      permission_mode: template.permission_mode, command: template.command, args: template.args, env: template.env,
+      cwd: template.cwd, ...overrides,
+    });
+    for (const forbidden of ["template", "name", "description"]) expect(expand({})).not.toHaveProperty(forbidden);
+
+    // The template's cwd is used, and the snapshot reports no selected-template identity.
+    const inherited = await call(capable, "create_session", { ...expand({}), model_id: "fake-model" });
+    expect(inherited.cwd).toBe(dir);
+    expect(inherited.template).toBeUndefined();
+    expect((await call(capable, "send_message", { session_id: inherited.session_id, text: "via-expansion" })).result.text).toBe("echo:via-expansion");
+    await call(capable, "close_session", { session_id: inherited.session_id });
+
+    // An explicit cwd override is reported and used.
+    const overridden = await call(capable, "create_session", { ...expand({ cwd: overrideDir }), model_id: "fake-model" });
+    expect(overridden.cwd).toBe(overrideDir);
+    expect(overridden.cwd).not.toBe(dir);
+    expect((await call(capable, "send_message", { session_id: overridden.session_id, text: "override" })).result.text).toBe("echo:override");
+    await call(capable, "close_session", { session_id: overridden.session_id });
+  });
+
+  it("runs a fake harness with the command/args/env expanded from a template", async () => {
+    const promptFile = join(dir, "expanded-prompts.txt");
+    await call(capable, "create_template", {
+      template: { name: "mcp-rich", harness: "codebuddy", command: process.execPath, args: [fakeHarness],
+        env: { FAKE_HARNESS_PROMPT_FILE: promptFile }, cwd: dir },
+    });
+    const found = (await call(capable, "search_template", { name: "mcp-rich" })).templates[0];
+    expect(found).toMatchObject({ command: process.execPath, args: [fakeHarness], env: { FAKE_HARNESS_PROMPT_FILE: promptFile } });
+    // A template's command/args/env are used as *information* and passed to create_session directly.
+    const session = (await call(capable, "create_session", {
+      harness: found.harness, runtime: found.runtime, target: found.target, command: found.command,
+      args: found.args, env: found.env, cwd: found.cwd, model_id: "fake-model",
+    })).session_id;
+    const status = await call(capable, "send_message", { session_id: session, text: "expanded-env" });
+    expect(status.result.text).toBe("echo:expanded-env");
+    // The env reached the harness (it recorded the prompt), proving command+args+env were applied.
+    expect(readFileSync(promptFile, "utf8")).toContain("expanded-env");
+    await call(capable, "close_session", { session_id: session });
+  });
+
+  it("round-trips a searched Docker template under a new name (null host_ip)", async () => {
+    await call(capable, "create_template", {
+      template: {
+        name: "mcp-docker-rt", harness: "codebuddy", runtime: "docker", docker_image: "example:latest", cwd: "/workspace",
+        ports: [{ host_port: 8080, container_port: 8080, protocol: "tcp", host_ip: null }],
+        mounts: [{ source: "/host/repo", target: "/workspace", read_only: false }],
+      },
+    });
+    const searched = (await call(capable, "search_template", { name: "mcp-docker-rt" })).templates[0];
+    // The server stores host_ip as null; the found template must be re-registrable unchanged.
+    expect(searched.ports[0]).toMatchObject({ host_port: 8080, container_port: 8080, protocol: "tcp", host_ip: null });
+    const renamed = await call(capable, "create_template", { template: { ...searched, name: "mcp-docker-rt-2" } });
+    expect(renamed.template).toMatchObject({ name: "mcp-docker-rt-2", docker_image: "example:latest", runtime: "docker" });
+    expect(renamed.template.ports[0]).toMatchObject({ host_port: 8080, host_ip: null });
+  });
+
+  it("rejects a template reference, template metadata, and launch internals on create_session", async () => {
+    for (const extra of [
+      { template: "mcp-local" }, { name: "mcp-local" }, { description: "x" },
+      { session_dir: "/tmp/x" }, { state_dir: "/tmp/x" }, { ssh_command: "sh" },
+    ]) {
+      const rejected = await capable.callTool({ name: "create_session", arguments: { cwd: dir, model_id: "fake-model", ...extra } });
+      expect(rejected.isError).toBe(true);
+    }
+  });
+
+  it("surfaces an invalid template registration", async () => {
+    const invalid = await capable.callTool({ name: "create_template", arguments: { template: { name: "bad-docker", harness: "codebuddy", docker_image: "img:1" } } });
+    expect(invalid.isError).toBe(true);
+    expect(payload(invalid)).toMatchObject({ ok: false, error: { code: "invalid_template" } });
+  });
+
+  it("rejects a create_session without cwd and a create_template with launch internals", async () => {
+    // cwd is required by the strict schema (not by the server) when no template can supply it.
+    const noCwd = await capable.callTool({ name: "create_session", arguments: { model_id: "fake-model" } });
+    expect(noCwd.isError).toBe(true);
+    // Template internals the server owns are rejected by the create_template schema.
+    const templateInternal = await capable.callTool({ name: "create_template", arguments: { template: { name: "x", harness: "codebuddy", docker_id: "a".repeat(64) } } });
+    expect(templateInternal.isError).toBe(true);
   });
 
   it("auto-answers a permission request through elicitation without approving by default", async () => {

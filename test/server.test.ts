@@ -47,22 +47,40 @@ async function connect(baseUrl: string) {
 }
 
 describe("MCP server wiring", () => {
-  it("lists the eleven bridge tools plus wait and proxies a success envelope", async () => {
-    const http = await stub(() => ({ ok: true, data: { status: "ok", protocol_version: 3 } }));
+  it("lists the eleven bridge tools plus the two template tools and wait, and proxies a success envelope", async () => {
+    const http = await stub(() => ({ ok: true, data: { status: "ok", protocol_version: 4 } }));
     cleanups.push(http.close);
     const mcp = await connect(http.baseUrl);
     const listed = await mcp.listTools();
     expect(listed.tools.map(tool => tool.name).sort()).toEqual([...TOOL_NAMES].sort());
-    expect(listed.tools).toHaveLength(12);
+    expect(listed.tools).toHaveLength(14);
     expect(listed.tools.map(tool => tool.name)).not.toContain("live_output");
     const result = await mcp.callTool({ name: "ping", arguments: {} });
     expect(result.isError).toBeFalsy();
     expect(text(result)).toMatchObject({ status: "ok" });
   });
 
+  it("routes create_template to POST /api/register_template and search_template to its own endpoint", async () => {
+    const http = await stub(method => {
+      if (method === "ping") return { ok: true, data: { status: "ok", protocol_version: 4 } };
+      if (method === "register_template") return { ok: true, data: { template: { name: "t", harness: "codebuddy" } } };
+      return { ok: true, data: { templates: [] } };
+    });
+    cleanups.push(http.close);
+    const mcp = await connect(http.baseUrl);
+    const created = await mcp.callTool({ name: "create_template", arguments: { template: { name: "t", harness: "codebuddy" } } });
+    expect(created.isError).toBeFalsy();
+    expect(text(created)).toMatchObject({ template: { name: "t", harness: "codebuddy" } });
+    const found = await mcp.callTool({ name: "search_template", arguments: { name: "t" } });
+    expect(text(found)).toEqual({ templates: [] });
+    // The alias never hits a non-existent create_template endpoint.
+    expect(http.requests.filter(method => method !== "ping")).toEqual(["register_template", "search_template"]);
+    expect(http.requests).not.toContain("create_template");
+  });
+
   it("returns the server error envelope as a structured tool error", async () => {
     const http = await stub(method => method === "ping"
-      ? { ok: true, data: { status: "ok", protocol_version: 3 } }
+      ? { ok: true, data: { status: "ok", protocol_version: 4 } }
       : { ok: false, error: { code: "session_not_found", message: "unknown session_id" } });
     cleanups.push(http.close);
     const mcp = await connect(http.baseUrl);
@@ -72,7 +90,7 @@ describe("MCP server wiring", () => {
   });
 
   it("rejects arguments the schema does not allow before calling the server", async () => {
-    const http = await stub(() => ({ ok: true, data: { status: "ok", protocol_version: 3 } }));
+    const http = await stub(() => ({ ok: true, data: { status: "ok", protocol_version: 4 } }));
     cleanups.push(http.close);
     const mcp = await connect(http.baseUrl);
     // `method_id` is no longer accepted by `authenticate`; the strict schema must reject it.
@@ -84,7 +102,7 @@ describe("MCP server wiring", () => {
   it.each(["wait", "send_message"])("uses the correct abort policy for %s", async name => {
     let terminal = false;
     const http = await stub(method => {
-      if (method === "ping") return { ok: true, data: { status: "ok", protocol_version: 3 } };
+      if (method === "ping") return { ok: true, data: { status: "ok", protocol_version: 4 } };
       if (method === "send_message") return { ok: true, data: { message_id: "m1" } };
       return { ok: true, data: { session_id: "s1", message_id: "m1", state: terminal ? "completed" : "running", terminal, questions: [], result: terminal ? { text: "done" } : undefined } };
     });
@@ -110,7 +128,7 @@ describe("MCP server wiring", () => {
 
   it("flags a failed terminal message as a tool error while preserving its status", async () => {
     const http = await stub(method => {
-      if (method === "ping") return { ok: true, data: { status: "ok", protocol_version: 3 } };
+      if (method === "ping") return { ok: true, data: { status: "ok", protocol_version: 4 } };
       if (method === "send_message") return { ok: true, data: { message_id: "m1" } };
       return { ok: true, data: { session_id: "s1", message_id: "m1", state: "failed", terminal: true, questions: [], error: { code: "invalid_json", message: "bad harness output" }, result: { text: "", reasoning: "", tool_calls: [], stop_reason: null, raw_result: null } } };
     });
@@ -124,7 +142,7 @@ describe("MCP server wiring", () => {
   it("marks a terminal status carrying an error as a tool error; a plain cancel is not", async () => {
     let withError = true;
     const http = await stub(method => {
-      if (method === "ping") return { ok: true, data: { status: "ok", protocol_version: 3 } };
+      if (method === "ping") return { ok: true, data: { status: "ok", protocol_version: 4 } };
       return { ok: true, data: { session_id: "s1", message_id: "m1", state: "cancelled", terminal: true, questions: [], ...(withError ? { error: { code: "input_timeout", message: "authentication question timed out" } } : {}) } };
     });
     cleanups.push(http.close);
@@ -141,7 +159,7 @@ describe("MCP server wiring", () => {
 
   it("flags a rate-limited authentication flow as a tool error while preserving its state", async () => {
     const http = await stub(method => {
-      if (method === "ping") return { ok: true, data: { status: "ok", protocol_version: 3 } };
+      if (method === "ping") return { ok: true, data: { status: "ok", protocol_version: 4 } };
       if (method === "authenticate") return { ok: true, data: { session_id: "s1", state: "authentication_rate_limited", terminal: true, questions: [], error: { code: "authentication_rate_limited", message: "rate limited", detail: { retry_after_seconds: 10 } } } };
       return { ok: true, data: {} };
     });
@@ -154,7 +172,7 @@ describe("MCP server wiring", () => {
 
   it("returns the authentication flow snapshot from the authenticate tool", async () => {
     const http = await stub(method => {
-      if (method === "ping") return { ok: true, data: { status: "ok", protocol_version: 3 } };
+      if (method === "ping") return { ok: true, data: { status: "ok", protocol_version: 4 } };
       if (method === "authenticate") return { ok: true, data: { session_id: "s1", state: "ready", terminal: true, questions: [], authenticated: true } };
       return { ok: true, data: {} };
     });
@@ -168,7 +186,7 @@ describe("MCP server wiring", () => {
   it("preserves the structured authentication_required envelope from create_session", async () => {
     const detail = { session_id: "s-auth", next_action: { method: "authenticate", params: { session_id: "s-auth" } } };
     const http = await stub(method => {
-      if (method === "ping") return { ok: true, data: { status: "ok", protocol_version: 3 } };
+      if (method === "ping") return { ok: true, data: { status: "ok", protocol_version: 4 } };
       if (method === "create_session") return { ok: false, error: { code: "authentication_required", message: "Authentication is required.", detail } };
       return { ok: true, data: {} };
     });
