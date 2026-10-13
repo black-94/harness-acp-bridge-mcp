@@ -60,7 +60,7 @@ export async function freePort(): Promise<number> {
 /**
  * A valid protocol-4 server config. Harness commands are no longer configuration: they come from an
  * explicit `command`/`args`/`env` or the target PATH (the integration suite installs PATH wrappers
- * around the fake harness). Only models are declared here.
+ * around the fake harness). Built-in adapters need no YAML declarations.
  */
 export function bridgeConfig(port: number, stateDir: string): string {
   return JSON.stringify({
@@ -70,14 +70,8 @@ export function bridgeConfig(port: number, stateDir: string): string {
     sessions: { max_concurrency: 4, reap_interval_seconds: 1 },
     timeouts: { startup_timeout_seconds: 5, request_timeout_seconds: 2, turn_timeout_seconds: 8, turn_cancel_timeout_seconds: 0.5, input_timeout_seconds: 1.5, terminate_grace_seconds: 0.1, remote_cleanup_timeout_seconds: 0.1, authentication_timeout_seconds: 1 },
     authentication: { rate_limit: { enabled: false } },
+    // This suite's normal fake harness is CodeBuddy; exercise default Codex in server tests.
     default_harness: "codebuddy",
-    harnesses: {
-      codebuddy: { models: [{ id: "fake-model", thinking_levels: ["low", "high"] }, { id: "fake-model-2" }] },
-      // The built-in `codex` adapter drives the fake harness's device-code URL elicitation, so the
-      // auth e2e exercises the real CodexAdapter normalization (server harness names are the fixed
-      // built-in `codebuddy`/`codex`/`agy`; there is no custom alias).
-      codex: { models: [{ id: "fake-model" }] },
-    },
   });
 }
 

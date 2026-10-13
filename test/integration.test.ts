@@ -95,11 +95,11 @@ describe.runIf(serverAvailable())("MCP proxy with autostart, elicitation and syn
     if (dir) rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
-  it("lists the eleven operations plus the two template tools and wait", async () => {
+  it("lists ten operations plus two template tools and wait", async () => {
     const listed = await capable.listTools();
     expect(listed.tools.map(tool => tool.name).sort()).toEqual([
       "answer_question", "auth_status", "authenticate", "cancel_message", "close_session", "create_session",
-      "create_template", "message_status", "ping", "search_harness", "search_template",
+      "create_template", "message_status", "ping", "search_template",
       "send_message", "set_session_options", "wait",
     ]);
   });
@@ -108,7 +108,7 @@ describe.runIf(serverAvailable())("MCP proxy with autostart, elicitation and syn
     expect(registry(clientDir)).toEqual({});
     expect(await call(capable, "ping")).toMatchObject({ status: "ok", protocol_version: 4 });
     expect(Object.keys(registry(clientDir))).toEqual([baseUrl]);
-    expect(await call(capable, "search_harness")).toHaveProperty("harnesses.codebuddy");
+    expect((await capable.listTools()).tools.map(tool => tool.name)).not.toContain("search_harness");
   });
 
   it("creates a session and synchronously completes a message", async () => {
@@ -121,13 +121,15 @@ describe.runIf(serverAvailable())("MCP proxy with autostart, elicitation and syn
   it("registers and searches a template without starting a harness", async () => {
     const sessionDirs = (): string[] => readdirSync(join(dir, "sessions"), { withFileTypes: true }).filter(entry => entry.isDirectory()).map(entry => entry.name).sort();
     const before = sessionDirs();
+    const guidance = { model: "fake-model", thinking: "low", before_start: "检查启动依赖。",
+      after_start: "检查会话状态。", special_instructions: "遵循用户指示 😀" };
     const created = await call(capable, "create_template", {
-      template: { name: "mcp-local", harness: "codebuddy", description: "local direct", cwd: dir },
+      template: { name: "mcp-local", harness: "codebuddy", description: "local direct", cwd: dir, ...guidance },
     });
     // The server applies defaults and returns the full template; no session was created.
     expect(created.template).toMatchObject({
       name: "mcp-local", harness: "codebuddy", runtime: "direct", target: "local",
-      cwd: dir, permission_mode: "auto", args: [], env: {}, mounts: [], ports: [], host_network: false,
+      cwd: dir, permission_mode: "auto", args: [], env: {}, mounts: [], ports: [], network_mode: "none", proxy_port: null, ...guidance,
     });
     expect(created.session_id).toBeUndefined();
     // Registering a template creates no session directory (templates.json is not a session).
@@ -136,7 +138,7 @@ describe.runIf(serverAvailable())("MCP proxy with autostart, elicitation and syn
     // Exact name, case-insensitive query, and harness all find it, with the full content.
     const byName = await call(capable, "search_template", { name: "mcp-local" });
     expect(byName.templates).toHaveLength(1);
-    expect(byName.templates[0]).toMatchObject({ name: "mcp-local", cwd: dir, permission_mode: "auto", command: null, docker_image: null });
+    expect(byName.templates[0]).toMatchObject({ name: "mcp-local", cwd: dir, permission_mode: "auto", command: null, docker_image: null, ...guidance });
     expect((await call(capable, "search_template", { query: "MCP-LOCAL" })).templates.map((t: { name: string }) => t.name)).toContain("mcp-local");
     expect((await call(capable, "search_template", { query: "direct" })).templates.map((t: { name: string }) => t.name)).toContain("mcp-local");
     expect((await call(capable, "search_template", { harness: "codebuddy" })).templates.map((t: { name: string }) => t.name)).toContain("mcp-local");
@@ -168,19 +170,23 @@ describe.runIf(serverAvailable())("MCP proxy with autostart, elicitation and syn
     const expand = (overrides: Record<string, unknown>): Record<string, unknown> => ({
       harness: template.harness, runtime: template.runtime, target: template.target,
       permission_mode: template.permission_mode, command: template.command, args: template.args, env: template.env,
-      cwd: template.cwd, ...overrides,
+      cwd: template.cwd,
+      ...(template.model !== null ? { model_id: template.model } : {}),
+      ...(template.thinking !== null ? { thinking_level: template.thinking } : {}), ...overrides,
     });
-    for (const forbidden of ["template", "name", "description"]) expect(expand({})).not.toHaveProperty(forbidden);
+    for (const forbidden of ["template", "name", "description", "model", "thinking", "before_start", "after_start", "special_instructions"]) expect(expand({})).not.toHaveProperty(forbidden);
 
     // The template's cwd is used, and the snapshot reports no selected-template identity.
-    const inherited = await call(capable, "create_session", { ...expand({}), model_id: "fake-model" });
+    const inherited = await call(capable, "create_session", expand({}));
+    expect(inherited.options).toMatchObject({ model_id: "fake-model", thinking_level: "low" });
     expect(inherited.cwd).toBe(dir);
     expect(inherited.template).toBeUndefined();
     expect((await call(capable, "send_message", { session_id: inherited.session_id, text: "via-expansion" })).result.text).toBe("echo:via-expansion");
     await call(capable, "close_session", { session_id: inherited.session_id });
 
     // An explicit cwd override is reported and used.
-    const overridden = await call(capable, "create_session", { ...expand({ cwd: overrideDir }), model_id: "fake-model" });
+    const overridden = await call(capable, "create_session", expand({ cwd: overrideDir, model_id: "fake-model-2", thinking_level: "high" }));
+    expect(overridden.options).toMatchObject({ model_id: "fake-model-2", thinking_level: "high" });
     expect(overridden.cwd).toBe(overrideDir);
     expect(overridden.cwd).not.toBe(dir);
     expect((await call(capable, "send_message", { session_id: overridden.session_id, text: "override" })).result.text).toBe("echo:override");
@@ -211,6 +217,7 @@ describe.runIf(serverAvailable())("MCP proxy with autostart, elicitation and syn
     await call(capable, "create_template", {
       template: {
         name: "mcp-docker-rt", harness: "codebuddy", runtime: "docker", docker_image: "example:latest", cwd: "/workspace",
+        network_mode: "proxy", proxy_port: 12345, env: { KEEP: "keep", HTTPS_PROXY: "stale" },
         ports: [{ host_port: 8080, container_port: 8080, protocol: "tcp", host_ip: null }],
         mounts: [{ source: "/host/repo", target: "/workspace", read_only: false }],
       },
@@ -218,8 +225,14 @@ describe.runIf(serverAvailable())("MCP proxy with autostart, elicitation and syn
     const searched = (await call(capable, "search_template", { name: "mcp-docker-rt" })).templates[0];
     // The server stores host_ip as null; the found template must be re-registrable unchanged.
     expect(searched.ports[0]).toMatchObject({ host_port: 8080, container_port: 8080, protocol: "tcp", host_ip: null });
+    expect(searched).not.toHaveProperty("host_network");
+    expect(searched).toMatchObject({ network_mode: "proxy", proxy_port: 12345, env: {
+      KEEP: "keep", http_proxy: "http://host.docker.internal:12345", https_proxy: "http://host.docker.internal:12345",
+      no_proxy: "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.local,.internal",
+    } });
+    expect(searched.env).not.toHaveProperty("HTTPS_PROXY");
     const renamed = await call(capable, "create_template", { template: { ...searched, name: "mcp-docker-rt-2" } });
-    expect(renamed.template).toMatchObject({ name: "mcp-docker-rt-2", docker_image: "example:latest", runtime: "docker" });
+    expect(renamed.template).toMatchObject({ name: "mcp-docker-rt-2", docker_image: "example:latest", runtime: "docker", env: searched.env, proxy_port: 12345 });
     expect(renamed.template.ports[0]).toMatchObject({ host_port: 8080, host_ip: null });
   });
 

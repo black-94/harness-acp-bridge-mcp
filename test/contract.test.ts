@@ -2,13 +2,13 @@ import { describe, expect, it } from "vitest";
 import { METHODS, TOOL_NAMES, TOOLS, WAIT_TOOL, schemaFor } from "../src/contract.ts";
 
 const EXPECTED_HTTP = [
-  "ping", "search_harness", "create_session", "close_session", "authenticate", "auth_status",
+  "ping", "create_session", "close_session", "authenticate", "auth_status",
   "set_session_options", "send_message", "cancel_message", "message_status", "answer_question",
   "register_template", "search_template",
 ];
 
 const EXPECTED_TOOLS = [
-  "ping", "search_harness", "search_template", "create_template", "create_session", "close_session",
+  "ping", "search_template", "create_template", "create_session", "close_session",
   "authenticate", "auth_status", "set_session_options", "send_message", "cancel_message",
   "message_status", "answer_question",
 ];
@@ -16,11 +16,11 @@ const EXPECTED_TOOLS = [
 const tool = (name: string) => TOOLS.find(entry => entry.name === name)!;
 
 describe("MCP bridge contract", () => {
-  it("exposes the eleven operations plus the two template tools and a wait helper", () => {
+  it("exposes ten operations plus two template tools and a wait helper", () => {
     expect([...METHODS].sort()).toEqual([...EXPECTED_HTTP].sort());
-    expect(TOOLS).toHaveLength(13);
+    expect(TOOLS).toHaveLength(12);
     expect(TOOLS.map(entry => entry.name).sort()).toEqual([...EXPECTED_TOOLS].sort());
-    expect(TOOL_NAMES).toHaveLength(14);
+    expect(TOOL_NAMES).toHaveLength(13);
     expect(TOOL_NAMES).toContain("wait");
     expect(TOOL_NAMES).not.toContain("live_output");
     expect(WAIT_TOOL.name).toBe("wait");
@@ -46,7 +46,7 @@ describe("MCP bridge contract", () => {
   });
 
   it("removed legacy names are absent", () => {
-    for (const legacy of ["harness_info", "auth_info", "set_model", "message_result", "send", "live_output"]) {
+    for (const legacy of ["search_harness", "harness_info", "auth_info", "set_model", "message_result", "send", "live_output"]) {
       expect(METHODS).not.toContain(legacy as never);
       expect(TOOL_NAMES).not.toContain(legacy);
     }
@@ -83,6 +83,9 @@ describe("MCP bridge contract", () => {
     expect(schema.safeParse({ cwd: "/repo", model_id: "m", template: "t" }).success).toBe(false);
     expect(schema.safeParse({ cwd: "/repo", model_id: "m", name: "t" }).success).toBe(false);
     expect(schema.safeParse({ cwd: "/repo", model_id: "m", description: "x" }).success).toBe(false);
+    for (const field of ["model", "thinking", "network_mode", "proxy_port", "before_start", "after_start", "special_instructions"]) {
+      expect(schema.safeParse({ cwd: "/repo", model_id: "m", [field]: "x" }).success).toBe(false);
+    }
   });
 
   it("create_session accepts the launch executable/argv/env and login_dirs, and validates docker options", () => {
@@ -167,7 +170,7 @@ describe("MCP bridge contract", () => {
         login_dirs: [{ source: "/a", target: "/b", read_only: true }],
         mounts: [{ source: "/c", target: "/d" }],
         ports: [{ host_port: 1, container_port: 2, protocol: "udp", host_ip: "127.0.0.1" }],
-        host_network: false,
+        network_mode: "none",
       },
     }).success).toBe(true);
     // Nullable fields accept null; enums are validated.
@@ -182,9 +185,48 @@ describe("MCP bridge contract", () => {
     expect(schema.safeParse({ template: { name: "t", harness: "codebuddy", runtime: "vm" } }).success).toBe(false);
     expect(schema.safeParse({ template: { name: "t", harness: "codebuddy", ports: [{ host_port: 0, container_port: 1 }] } }).success).toBe(false);
     // Unknown template fields are rejected, including launch internals the server owns.
-    for (const extra of ["docker_id", "session_dir", "ssh_host", "container_record_id"]) {
+    for (const extra of ["host_network", "docker_id", "session_dir", "ssh_host", "container_record_id"]) {
       expect(schema.safeParse({ template: { name: "t", harness: "codebuddy", [extra]: "x" } }).success).toBe(false);
     }
+  });
+
+  it("accepts none/host/proxy with one port, rejects legacy/conflicting modes and validates session proxy conflicts", () => {
+    const schema = schemaFor("create_template"); const base = { name: "network", harness: "codex", runtime: "docker", docker_image: "image" };
+    for (const network_mode of ["none", "host"]) expect(schema.safeParse({ template: { ...base, network_mode } }).success).toBe(true);
+    expect(schema.safeParse({ template: { ...base, network_mode: "proxy", proxy_port: 12345 } }).success).toBe(true);
+    for (const extra of [{ network_mode: "invalid" }, { host_network: false }, { network_mode: "proxy" },
+      { network_mode: "proxy", proxy_port: null }, { network_mode: "host", proxy_port: 12345 },
+      { network_mode: "none", env: { http_proxy: "http://proxy:1" } }, { network_mode: "host", ports: [{ host_port: 1, container_port: 2 }] },
+      { runtime: "direct", network_mode: "proxy", proxy_port: 12345 }]) {
+      expect(schema.safeParse({ template: { ...base, ...extra } }).success).toBe(false);
+    }
+    for (const proxy_port of [0, 65536, 1.5, "12345"]) expect(schema.safeParse({ template: { ...base, network_mode: "proxy", proxy_port } }).success).toBe(false);
+    const session = schemaFor("create_session");
+    for (const key of ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]) {
+      expect(session.safeParse({ cwd: "/w", model_id: "m", runtime: "docker", docker_image: "i", host_network: true, env: { [key]: "http://proxy:1" } }).success).toBe(false);
+    }
+    expect(session.safeParse({ cwd: "/w", model_id: "m", runtime: "docker", docker_image: "i", host_network: true, env: { http_proxy: "", no_proxy: "localhost" } }).success).toBe(true);
+    expect(tool("create_template").description).toContain("proxy_port");
+    expect(tool("create_session").description).toContain("network_mode and proxy_port are template-only");
+  });
+
+  it("preserves model/thinking defaults and natural-language LLM guidance", () => {
+    const schema = schemaFor("create_template"); const base = { name: "guided", harness: "codebuddy" };
+    const fields = { model: "custom-model", thinking: "custom-effort", before_start: "启动前检查目录。\n确认依赖。",
+      after_start: "启动后检查状态。", special_instructions: "遵循用户指示 😀" };
+    expect(schema.parse({ template: { ...base, ...fields } })).toEqual({ template: { ...base, ...fields } });
+    for (const field of Object.keys(fields)) {
+      expect(schema.safeParse({ template: { ...base, [field]: null } }).success).toBe(true);
+      for (const value of [123, [], "bad\0text"]) expect(schema.safeParse({ template: { ...base, [field]: value } }).success).toBe(false);
+    }
+    for (const field of ["model", "thinking"]) {
+      for (const value of ["", " \n "]) expect(schema.safeParse({ template: { ...base, [field]: value } }).success).toBe(false);
+    }
+    for (const name of ["search_template", "create_session"]) {
+      for (const field of ["before_start", "after_start", "special_instructions"]) expect(tool(name).description).toContain(field);
+    }
+    expect(tool("create_session").description).toContain("model to model_id");
+    expect(tool("create_session").description).toContain("thinking to thinking_level");
   });
 
   it("answer_question takes a string request_id, answer enum, option_id, and object content; message_id is optional", () => {

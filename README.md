@@ -121,7 +121,6 @@ Eleven operations plus `search_template`, `create_template`, and `wait`:
 | Tool | Behavior |
 | --- | --- |
 | `ping` | Liveness, protocol version, PID, uptime, live session count, config fingerprint. |
-| `search_harness` | Configured harnesses, models, thinking levels, permission modes. Starts nothing. |
 | `search_template` | Find launch templates by exact `name`, `query` (case-insensitive substring of name/harness/description), and/or `harness`; returns each match in full. Starts nothing. |
 | `create_template` | Durably register a launch template from `{template: {...}}`. A **client alias** for the server's `register_template` — there is no `POST /api/create_template`. Duplicate names are rejected (`template_exists`) and never overwritten. Starts nothing. |
 | `create_session` | Create a session-owned harness from explicit parameters: required `model_id` and `cwd`, plus optional `harness`, `command`/`args`/`env`, `thinking_level`, `permission_mode`, `target`/`remote_host`, `runtime`, and the Docker fields (`docker_image` or `docker_id`, `container_policy`, `login_dirs`, `mounts`, `ports`, `host_network`). There is **no** `template` parameter. |
@@ -143,31 +142,54 @@ deliberately **not** exposed as a tool.
 
 ### Launch templates
 
-The server stores launch templates (command/argv/env/Docker defaults), but templates are
+`search_harness` is removed; select a harness via launch templates or explicit session parameters.
+The server stores launch templates (model/thinking/instruction/command/argv/env/Docker defaults), but templates are
 **information only**: `create_session` never references one. The intended workflow:
 
 1. The user names or describes a template. Call `search_template` with an exact `name` when
    known, otherwise with `query`/`harness`. If several match, ask the user which one before
    proceeding.
 2. Read the returned template's full content — the proxy never guesses it.
-3. Drop `name`/`description` and every field that does not apply to the session you are creating
-   (e.g. all Docker fields for a direct session), then collect the missing values from the user:
-   `model_id` is **always required** (templates store no model or thinking level), plus any `cwd`
-   the template does not provide and any explicit overrides. Omit a field the template stores as
-   `null` when `null` is not a valid session value (a local `remote_host`, a `null` `cwd`).
-4. Call `create_session` with those **explicit** parameters — never `template`/`name`/`description`,
-   which the strict schema rejects. When you override `runtime`/`target`, re-check the combination
-   (Docker fields require `runtime: docker`; a remote target needs `remote_host`). The proxy never
-   merges or re-implements template defaults for you.
+3. Map non-null `model` → `model_id`, `thinking` → `thinking_level`; user overrides win. Ask only
+   for a missing model or `cwd`. No model/thinking candidate lists are required in server YAML.
+4. Follow `special_instructions` throughout; the calling LLM executes `before_start` before
+   startup and `after_start` after successful startup and any required authentication. These are
+   natural-language prompts, not proxy/server hooks, and remain subject to user approval and safety
+   rules. Report failures/unavailable tools rather than claiming actions ran.
+5. Map Docker `network_mode` to session `host_network` (`host` → true; `none`/`proxy` → false)
+   and pass the returned `env`. Drop `name`/`description`/`model`/`thinking`/`network_mode`/`proxy_port`/
+   `before_start`/`after_start`/`special_instructions`
+   and inapplicable fields, then call `create_session` with only allowed **explicit** fields.
+   Omit invalid nulls (local `remote_host`, missing `cwd`) and re-check runtime/target combinations.
+   The proxy never merges a template or executes its instructions.
 
 To create a template, call `create_template` with a `{template: {...}}` object. Only the fields
 the server can register are accepted: `name` (required), `harness` (required), and optional
-`description`, `runtime`, `target`, `remote_host`, `permission_mode`, `command`, `args`, `env`,
-`cwd`, `docker_image`, `container_policy`, `login_dirs`, `mounts`, `ports`, `host_network`.
+`description`, `model`, `thinking`, `before_start`, `after_start`, `special_instructions`,
+`runtime`, `target`, `remote_host`, `permission_mode`, `command`, `args`, `env`,
+`cwd`, `docker_image`, `container_policy`, `login_dirs`, `mounts`, `ports`, `network_mode`, `proxy_port`.
 Unknown fields are rejected. Prefer collecting and confirming the values with the user first; the
 `acp-create-template` skill (published with the Pi extension package, and portable to MCP hosts)
-documents that interview. Registering a template never creates or starts a session.
+documents that interview. Registering a template never creates or starts a session or executes
+instruction fields. All five new fields are nullable/optional; model/thinking must be nonblank when
+set. Existing templates load with null defaults. Remove the entire obsolete `harnesses` section
+from server YAML; all built-in adapters are available without declarations. Select the harness via
+templates or explicit session parameters; omitted harness defaults to Codex (overridable with
+`default_harness`). No YAML file is needed when all service settings use defaults.
 
+
+### Docker network modes
+
+Templates use `network_mode: none | host | proxy`, not the old `host_network` (rejected).
+`none` is ordinary bridge without proxy values; `host` enables host network without proxies or
+published ports. `proxy` requires only `proxy_port` (1–65535): registration sets identical lowercase
+`http_proxy`/`https_proxy` to `http://host.docker.internal:PORT`, and `no_proxy` to
+`localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.local,.internal`.
+It replaces stale proxy aliases while keeping unrelated env; the service need not be Xray.
+Pass this returned env to `create_session`, map mode to its `host_network` boolean, and omit the
+metadata `network_mode`/`proxy_port`. Confirm host-address/port reachability from the target Docker
+container and HTTP-client/CIDR support; do not infer it from a successful env round-trip.
+Re-register old templates; no old-template migration is implemented.
 
 ### Authentication
 

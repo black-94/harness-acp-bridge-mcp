@@ -14,7 +14,6 @@ import { z } from "zod";
 /** Server HTTP methods this proxy calls. `register_template` backs the `create_template` tool. */
 export const METHODS = [
   "ping",
-  "search_harness",
   "create_session",
   "close_session",
   "authenticate",
@@ -29,6 +28,7 @@ export const METHODS = [
 ] as const;
 export type BridgeMethod = (typeof METHODS)[number];
 
+const proxyEnvKeys = ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"];
 const permissionMode = z.enum(["read", "edit", "auto", "yolo"]);
 /** Every caller string that can reach an exec string must be NUL-free (the server enforces this too). */
 const noNul = (schema: z.ZodString): z.ZodString => schema.refine(value => !value.includes("\0"), "must not contain NUL");
@@ -85,6 +85,16 @@ const launchTemplate = z
     name: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),
     description: z.string().nullable().optional(),
     harness: z.enum(["codebuddy", "codex", "agy"]),
+    model: noNul(z.string().min(1)).refine(value => value.trim().length > 0, "must not be blank").nullable().optional()
+      .describe("Default model_id for create_session; not a candidate list."),
+    thinking: noNul(z.string().min(1)).refine(value => value.trim().length > 0, "must not be blank").nullable().optional()
+      .describe("Default thinking_level for create_session; validated by the live harness."),
+    before_start: noNul(z.string()).nullable().optional()
+      .describe("Natural-language actions for the calling LLM before ACP startup; never a server hook."),
+    after_start: noNul(z.string()).nullable().optional()
+      .describe("Natural-language actions for the calling LLM after startup; never a server hook."),
+    special_instructions: noNul(z.string()).nullable().optional()
+      .describe("Natural-language guidance for the calling LLM throughout the workflow."),
     runtime: z.enum(["direct", "docker"]).optional(),
     target: z.enum(["local", "remote"]).optional(),
     remote_host: noNul(z.string()).nullable().optional(),
@@ -98,9 +108,27 @@ const launchTemplate = z
     login_dirs: z.array(dockerMount).optional(),
     mounts: z.array(dockerMount).optional(),
     ports: z.array(templatePort).optional(),
-    host_network: z.boolean().optional(),
+    network_mode: z.enum(["none", "host", "proxy"]).optional()
+      .describe("Docker networking, default none. host maps to session host_network=true; proxy requires proxy_port and generates http_proxy/https_proxy/no_proxy in env. Not a create_session field."),
+    proxy_port: z.number().int().min(1).max(65535).nullable().optional()
+      .describe("Host HTTP proxy port for network_mode=proxy. Generates identical http_proxy/https_proxy at http://host.docker.internal:PORT and no_proxy for common private ranges."),
   })
-  .strict();
+  .strict()
+  .refine(data => !data.network_mode || data.network_mode === "none" || data.runtime === "docker", {
+    message: "network_mode=host/proxy requires runtime=docker", path: ["network_mode"],
+  })
+  .refine(data => data.network_mode !== "proxy" || data.proxy_port != null, {
+    message: "network_mode=proxy requires proxy_port", path: ["proxy_port"],
+  })
+  .refine(data => data.network_mode === "proxy" || data.proxy_port == null, {
+    message: "proxy_port requires network_mode=proxy", path: ["proxy_port"],
+  })
+  .refine(data => data.runtime !== "docker" || data.network_mode === "proxy" || !proxyEnvKeys.some(key => Boolean(data.env?.[key]?.trim())), {
+    message: "proxy environment variables require network_mode=proxy", path: ["env"],
+  })
+  .refine(data => data.network_mode !== "host" || !(data.ports?.length), {
+    message: "network_mode=host cannot be combined with published ports", path: ["ports"],
+  });
 
 /**
  * `create_session` fields shared by both variants. `cwd` and `model_id` are always required: a
@@ -146,7 +174,6 @@ function hasEffectiveDocker(data: Record<string, unknown>): boolean {
 
 const schemas: Record<BridgeMethod, z.ZodType> = {
   ping: z.object({}).strict(),
-  search_harness: z.object({ harness: z.string().min(1).optional() }).strict(),
   // A single strict object (the MCP SDK exports only object schemas to the model, so a root union
   // would arrive empty). `cwd` and `model_id` are required, there is no `template` parameter, and
   // the object-level refinements enforce the key cross-field rules (all also enforced server-side):
@@ -158,6 +185,10 @@ const schemas: Record<BridgeMethod, z.ZodType> = {
     .refine(data => !(data.host_network === true && (data.ports?.length ?? 0) > 0), {
       message: "host_network cannot be combined with published ports",
       path: ["ports"],
+    })
+    .refine(data => !(data.host_network === true && proxyEnvKeys.some(key => Boolean(data.env?.[key]?.trim()))), {
+      message: "host_network cannot be combined with proxy environment variables; use Docker bridge + env.http_proxy for proxy mode",
+      path: ["env"],
     })
     .refine(data => data.docker_id === undefined || !(
       typeof data.docker_image === "string" ||
@@ -238,18 +269,10 @@ const toolDefs: Array<Omit<BridgeTool, "method"> & { method?: BridgeMethod }> = 
     annotations: readOnly,
   },
   {
-    name: "search_harness",
-    title: "Search harnesses",
-    description:
-      "List configured harnesses with their models, declared thinking levels, and permission modes, from configuration only. Starts no harness and performs no discovery probes.",
-    inputSchema: schemas.search_harness,
-    annotations: readOnly,
-  },
-  {
     name: "search_template",
     title: "Search launch templates",
     description:
-      "Find registered launch templates by exact name, free-text query (case-insensitive substring of name/harness/description), and/or harness. Returns each matching template in full, including its command/args/env/cwd/Docker defaults. Templates are INFORMATION ONLY: create_session never accepts a template name, so read the returned object and expand the allowed fields yourself when creating a session. Starts no harness.",
+      "Find registered launch templates by exact name, free-text query (case-insensitive substring of name/harness/description), and/or harness. Returns each matching template in full, including its model/thinking, network_mode, before_start/after_start/special_instructions, and command/args/env/cwd/Docker defaults. The calling LLM follows special_instructions throughout, executes before_start before creating the session and after_start after startup (completing required authentication), subject to user approval and safety rules. Never forward these instruction fields to create_session. Templates are INFORMATION ONLY: create_session never accepts a template name, so read the returned object and expand the allowed fields yourself when creating a session. Starts no harness.",
     inputSchema: schemas.search_template,
     annotations: readOnly,
   },
@@ -258,7 +281,7 @@ const toolDefs: Array<Omit<BridgeTool, "method"> & { method?: BridgeMethod }> = 
     method: "register_template",
     title: "Create launch template",
     description:
-      "Durably register a launch template (client alias for the server's register_template; it does not create a session and starts no harness). Supply {template: {...}} with name and harness plus any of description/runtime/target/remote_host/permission_mode/command/args/env/cwd/docker_image/container_policy/login_dirs/mounts/ports/host_network. A duplicate name is rejected (template_exists) and never overwrites the existing template. Collect the values with the user first (see the acp-create-template skill) and confirm the summary.",
+      "Durably register a launch template (client alias for the server's register_template; it does not create a session and starts no harness). Supply {template: {...}} with name and harness plus any of description/model/thinking/before_start/after_start/special_instructions/runtime/target/remote_host/permission_mode/command/args/env/cwd/docker_image/container_policy/login_dirs/mounts/ports/network_mode/proxy_port. model/thinking are optional defaults; the last three instruction fields are natural-language guidance executed by the calling LLM, never server hooks. For Docker, ask for network_mode=none (ordinary bridge, no proxy), host (host network, no proxy or published ports), or proxy (ordinary bridge plus proxy_port, an integer 1-65535). In proxy mode the server generates identical lowercase env.http_proxy and env.https_proxy as http://host.docker.internal:PORT and env.no_proxy for localhost/private ranges; it replaces stale proxy variables while preserving unrelated env. Do not ask for three separate proxy values. Proxy service is generic, not tied to Xray. Old template host_network is rejected. Never guess protocol/host/port or use container loopback for the host. A duplicate name is rejected (template_exists) and never overwrites the existing template. Collect the values with the user first (see the acp-create-template skill) and confirm the summary.",
     inputSchema: schemas.register_template,
     annotations: serverWrite,
   },
@@ -266,7 +289,7 @@ const toolDefs: Array<Omit<BridgeTool, "method"> & { method?: BridgeMethod }> = 
     name: "create_session",
     title: "Create session",
     description:
-      "Create a session-owned harness process from explicit parameters. cwd and model_id are REQUIRED; there is no template parameter. Launch parameters: harness; command (absolute executable path or single executable name; empty/omitted uses the harness's built-in command) and args/env; permission_mode/thinking_level; target/remote_host; runtime and the Docker fields (docker_image for a new container, or docker_id to reuse; container_policy, login_dirs, mounts, ports, host_network). login_dirs and mounts are bind mounts used only for runtime=docker; login_dirs persist the harness's own credentials (not bridge credentials). To start from a template: search_template (exact name, else query/harness), read the returned object in full, DROP name/description and any field that does not apply (e.g. all Docker fields for a direct session), collect a model_id and any missing cwd from the user, apply the user's overrides, then pass only the allowed create_session fields — never pass template/name/description. Omit a field the template stores as null when null is not a valid session value (a local template's remote_host: null — pass remote_host only for a remote session; a null cwd — supply the user's cwd). When you override runtime or target, re-check that the remaining fields are still valid (e.g. Docker fields require docker; a remote target needs remote_host). Returns the session snapshot (no template identity). If authentication is required, the structured error carries session_id and a next_action telling you to call authenticate.",
+      "Create a session-owned harness process from explicit parameters. cwd and model_id are REQUIRED; there is no template parameter. Launch parameters: harness (codebuddy/codex/agy are built in and need no YAML declaration; omitted uses default_harness, Codex by default); command (absolute executable path or single executable name; empty/omitted uses the harness's built-in command) and args/env; permission_mode/thinking_level; target/remote_host; runtime and the Docker fields (docker_image for a new container, or docker_id to reuse; container_policy, login_dirs, mounts, ports, host_network). login_dirs and mounts are bind mounts used only for runtime=docker; login_dirs persist the harness's own credentials (not bridge credentials). Map a Docker template's network_mode to host_network: host means true, none/proxy mean false; for proxy pass the returned env (generated from proxy_port, with identical http_proxy/https_proxy and common-private-range no_proxy), preserving all three proxy keys and unrelated env. network_mode and proxy_port are template-only, never session fields. Host networking cannot coexist with active proxy values. Verify proxy protocol/host/port reachability from the container; container loopback is not the host. Do not change proxy/firewall settings without approval. This is the harness's proxy, not the bridge client's. To start from a template: search_template (exact name, else query/harness), read the returned object in full, map non-null model to model_id and thinking to thinking_level, apply the user's overrides, and ask only for a missing model_id or cwd. Follow special_instructions throughout, execute before_start before creating the session and after_start after startup (completing required authentication), subject to user approval and safety rules; stop and report failures rather than claiming actions ran. DROP name/description/model/thinking/network_mode/proxy_port/before_start/after_start/special_instructions and any field that does not apply (e.g. all Docker fields for a direct session), then pass only allowed create_session fields — never forward template-only fields. Omit a field the template stores as null when null is not a valid session value (a local template's remote_host: null — pass remote_host only for a remote session; a null cwd — supply the user's cwd). When you override runtime or target, re-check that the remaining fields are still valid (e.g. Docker fields require docker; a remote target needs remote_host). Returns the session snapshot (no template identity). If authentication is required, the structured error carries session_id and a next_action telling you to call authenticate.",
     inputSchema: schemas.create_session,
     annotations: external,
   },

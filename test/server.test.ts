@@ -47,13 +47,14 @@ async function connect(baseUrl: string) {
 }
 
 describe("MCP server wiring", () => {
-  it("lists the eleven bridge tools plus the two template tools and wait, and proxies a success envelope", async () => {
+  it("lists ten bridge tools plus two template tools and wait, and proxies a success envelope", async () => {
     const http = await stub(() => ({ ok: true, data: { status: "ok", protocol_version: 4 } }));
     cleanups.push(http.close);
     const mcp = await connect(http.baseUrl);
     const listed = await mcp.listTools();
     expect(listed.tools.map(tool => tool.name).sort()).toEqual([...TOOL_NAMES].sort());
-    expect(listed.tools).toHaveLength(14);
+    expect(listed.tools).toHaveLength(13);
+    expect(listed.tools.map(tool => tool.name)).not.toContain("search_harness");
     expect(listed.tools.map(tool => tool.name)).not.toContain("live_output");
     const result = await mcp.callTool({ name: "ping", arguments: {} });
     expect(result.isError).toBeFalsy();
