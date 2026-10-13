@@ -6,7 +6,6 @@ import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ServerLifecycle, redact } from "../src/lifecycle.ts";
 import type { McpSettings } from "../src/config.ts";
-import { ServerLifecycle as PiServerLifecycle } from "../../pi-extension/src/lifecycle.ts";
 import { bridgeConfig, freePort, killRegistryServers, newContractServerCli, newContractServerEntry, registry, serverAvailable } from "./support.ts";
 
 const cleanups: Array<() => Promise<void> | void> = [];
@@ -195,24 +194,6 @@ describe.runIf(serverAvailable())("managed local server lifecycle", () => {
     expect(registry(clientDir)).toEqual({});
   });
 
-  it("has a Pi client and an MCP client share a single started instance", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "mcp-life-"));
-    const port = await freePort();
-    const config = join(dir, "config.yaml");
-    writeFileSync(config, bridgeConfig(port, join(dir, "sessions")));
-    const baseUrl = `http://127.0.0.1:${port}`;
-    const clientDir = join(dir, "client");
-    cleanups.push(() => { killRegistryServers(clientDir); rmSync(dir, { recursive: true, force: true }); });
-    const env = { ...process.env, HARNESS_ACP_BRIDGE_CLIENT_DIR: clientDir };
-    const piSettings = { baseUrl, requestTimeoutMs: 15000, interactionTimeoutMs: 5000, pollIntervalMs: 200, autoStart: true, serverEntry: newContractServerEntry(), configPath: config, startupTimeoutMs: 15000 };
-    const results = await Promise.all([
-      new ServerLifecycle(settings(baseUrl, clientDir, { configPath: config }), env).ensure(),
-      new PiServerLifecycle(piSettings, env).ensure(),
-    ]);
-    expect(results.filter(result => result.owned)).toHaveLength(1);
-    expect(results.every(result => result.baseUrl === baseUrl)).toBe(true);
-    expect(Object.keys(registry(clientDir))).toEqual([baseUrl]);
-  });
 });
 
 function alive(pid: number): boolean {

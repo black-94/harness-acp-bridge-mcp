@@ -20,6 +20,8 @@ describe("npm release metadata", () => {
     expect(manifest.files).toContain("dist");
     expect(manifest.files).not.toContain("test");
     expect(manifest.dependencies["@black942026/harness-acp-bridge-server"]).toBeDefined();
+    expect(manifest.dependencies["@black942026/harness-acp-bridge-pi-extension"]).toBeUndefined();
+    expect(manifest.devDependencies["@black942026/harness-acp-bridge-pi-extension"]).toBeUndefined();
     const server = JSON.parse(readFileSync(new URL("../node_modules/@black942026/harness-acp-bridge-server/package.json", import.meta.url), "utf8"));
     expect(server.exports["."]).toBe("./dist/index.js");
   });

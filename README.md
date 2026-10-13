@@ -269,6 +269,7 @@ npm run check                 # clean + build + typecheck + tests
 npm pack --dry-run
 ```
 
+The package and its tests do not import or require the Pi extension checkout or dependencies.
 `npm run check` starts a real server and its fake ACP harness (no paid model, Docker, or SSH) and
 drives it through real stdio MCP clients with and without elicitation capability, including
 autostart, reuse, answer+wait, cancel, the authentication flow (unauthenticated
